@@ -2,6 +2,7 @@ package imap
 
 import (
 	"testing"
+	"time"
 
 	"github.com/wltechblog/gommail/internal/email"
 )
@@ -226,6 +227,35 @@ func TestWorkerIntegration(t *testing.T) {
 
 	// These should not panic
 	wrapper.worker.MarkInitialSyncComplete("INBOX")
+}
+
+func TestClientWrapperSearchTimeout(t *testing.T) {
+	config := email.ServerConfig{Host: "test.example.com", Port: 993, Username: "test@example.com", Password: "password", TLS: true}
+	wrapper := NewClientWrapper(config)
+	t.Cleanup(wrapper.Stop)
+
+	defaultTimeout := wrapper.defaultTimeout
+	baseCriteria := email.SearchCriteria{MaxResults: 50}
+
+	timeout := wrapper.getSearchTimeout(baseCriteria, true)
+	if timeout != defaultTimeout {
+		t.Fatalf("expected default timeout %v, got %v", defaultTimeout, timeout)
+	}
+
+	noFolderTimeout := wrapper.getSearchTimeout(baseCriteria, false)
+	if noFolderTimeout <= defaultTimeout {
+		t.Fatalf("expected no-folder timeout greater than default (%v <= %v)", noFolderTimeout, defaultTimeout)
+	}
+
+	serverTimeout := wrapper.getSearchTimeout(email.SearchCriteria{SearchServer: true}, true)
+	if serverTimeout <= defaultTimeout {
+		t.Fatalf("expected server search timeout greater than default (%v <= %v)", serverTimeout, defaultTimeout)
+	}
+
+	largeResultTimeout := wrapper.getSearchTimeout(email.SearchCriteria{MaxResults: 1000}, true)
+	if largeResultTimeout <= 2*time.Minute {
+		t.Fatalf("expected large-result timeout > 2m, got %v", largeResultTimeout)
+	}
 }
 
 // BenchmarkClientWrapperCreation benchmarks client wrapper creation

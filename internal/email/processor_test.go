@@ -376,7 +376,7 @@ This is the plain text version.
 Content-Type: text/html; charset=utf-8
 Content-Transfer-Encoding: quoted-printable
 
-<html><body>=09=09=09<p>Sign In to Highlights</p>=09=09=09<p>Click the button below to sign in.</p></body></html>
+<html><body>=09=09=09<p>Example Title</p>=09=09=09<p>Example instructions go here.</p></body></html>
 
 --boundary123--
 `
@@ -397,7 +397,7 @@ Content-Transfer-Encoding: quoted-printable
 	}
 
 	// Verify HTML content is properly decoded (should contain tabs)
-	if !strings.Contains(msg.Body.HTML, "\t\t\t<p>Sign In to Highlights</p>") {
+	if !strings.Contains(msg.Body.HTML, "\t\t\t<p>Example Title</p>") {
 		t.Errorf("HTML content does not contain properly decoded tabs: %s", msg.Body.HTML)
 	}
 

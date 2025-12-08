@@ -521,7 +521,7 @@ func (w *ClientWrapper) SearchMessages(criteria email.SearchCriteria) ([]email.M
 	cmd := NewCommand(CmdSearchMessages, map[string]interface{}{
 		ParamCriteria: &criteria,
 	})
-	response, err := w.sendCommandWithTimeout(cmd, w.defaultTimeout)
+	response, err := w.sendCommandWithTimeout(cmd, w.getSearchTimeout(criteria, false))
 	if err != nil {
 		return nil, wrapCommandError("search messages", err)
 	}
@@ -544,7 +544,7 @@ func (w *ClientWrapper) SearchMessagesInFolder(folder string, criteria email.Sea
 		ParamFolderName: folder,
 		ParamCriteria:   &criteria,
 	})
-	response, err := w.sendCommandWithTimeout(cmd, w.defaultTimeout)
+	response, err := w.sendCommandWithTimeout(cmd, w.getSearchTimeout(criteria, true))
 	if err != nil {
 		return nil, wrapCommandError("search messages in folder", err)
 	}
@@ -559,6 +559,24 @@ func (w *ClientWrapper) SearchMessagesInFolder(folder string, criteria email.Sea
 	}
 
 	return messages, nil
+}
+
+func (w *ClientWrapper) getSearchTimeout(criteria email.SearchCriteria, folderSpecified bool) time.Duration {
+	timeout := w.defaultTimeout
+
+	if criteria.SearchServer || !folderSpecified {
+		if timeout < 2*time.Minute {
+			timeout = 2 * time.Minute
+		}
+	}
+
+	if criteria.MaxResults == 0 || criteria.MaxResults > 200 {
+		if timeout < 3*time.Minute {
+			timeout = 3 * time.Minute
+		}
+	}
+
+	return timeout
 }
 
 // SearchCachedMessages searches for messages in the cache using the given criteria

@@ -92,6 +92,11 @@ const (
 	SortDescending
 )
 
+const (
+	messageDateColumnWidth   float32 = 120
+	messageSenderColumnWidth float32 = 180
+)
+
 // MainWindow represents the main application window.
 //
 // Architecture:
@@ -297,6 +302,65 @@ func (r *messageListRenderer) Destroy() {
 	// Nothing to destroy
 }
 
+type messageListColumnsLayout struct {
+	dateWidth   float32
+	senderWidth float32
+}
+
+func (l *messageListColumnsLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
+	if len(objects) < 3 {
+		return
+	}
+
+	height := size.Height
+	if height <= 0 {
+		height = objects[0].MinSize().Height
+	}
+
+	dateObj := objects[0]
+	senderObj := objects[1]
+	subjectObj := objects[2]
+
+	dateObj.Resize(fyne.NewSize(l.dateWidth, height))
+	dateObj.Move(fyne.NewPos(0, 0))
+
+	senderObj.Resize(fyne.NewSize(l.senderWidth, height))
+	senderObj.Move(fyne.NewPos(l.dateWidth, 0))
+
+	subjectWidth := size.Width - l.dateWidth - l.senderWidth
+	if subjectWidth < 0 {
+		subjectWidth = 0
+	}
+
+	subjectObj.Resize(fyne.NewSize(subjectWidth, height))
+	subjectObj.Move(fyne.NewPos(l.dateWidth+l.senderWidth, 0))
+}
+
+func (l *messageListColumnsLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	var height float32
+	var subjectWidth float32
+
+	if len(objects) >= 3 {
+		subjectWidth = objects[2].MinSize().Width
+	}
+
+	if subjectWidth == 0 {
+		subjectWidth = 50
+	}
+
+	for _, obj := range objects {
+		if obj == nil {
+			continue
+		}
+
+		if h := obj.MinSize().Height; h > height {
+			height = h
+		}
+	}
+
+	return fyne.NewSize(l.dateWidth+l.senderWidth+subjectWidth, height)
+}
+
 // messageListItem is a custom widget that represents a single message in the list
 // It implements fyne.SecondaryTappable to handle right-click events directly
 type messageListItem struct {
@@ -306,7 +370,7 @@ type messageListItem struct {
 	dateLabel    *widget.Label
 	senderLabel  *widget.Label
 	subjectLabel *widget.Label
-	hbox         *fyne.Container
+	content      *fyne.Container
 	background   *canvas.Rectangle
 	isSelected   bool
 }
@@ -314,22 +378,30 @@ type messageListItem struct {
 // newMessageListItem creates a new message list item widget
 func newMessageListItem(mainWindow *MainWindow) *messageListItem {
 	dateLabel := widget.NewLabel("Jan 1, 15:04")
+	dateLabel.Truncation = fyne.TextTruncateEllipsis
+
 	senderLabel := widget.NewLabel("Sender Name")
+	senderLabel.Truncation = fyne.TextTruncateEllipsis
+
 	subjectLabel := widget.NewLabel("Subject line that should be fully visible and not truncated")
+	subjectLabel.Wrapping = fyne.TextWrapOff
+	subjectLabel.Truncation = fyne.TextTruncateEllipsis
 
-	hbox := container.NewHBox(dateLabel, senderLabel, subjectLabel)
+	content := container.New(&messageListColumnsLayout{
+		dateWidth:   messageDateColumnWidth,
+		senderWidth: messageSenderColumnWidth,
+	}, dateLabel, senderLabel, subjectLabel)
 
-	// Create background rectangle for selection highlighting
 	background := canvas.NewRectangle(theme.Color(theme.ColorNameBackground))
-	background.Hide() // Initially hidden
+	background.Hide()
 
 	item := &messageListItem{
 		mainWindow:   mainWindow,
-		messageID:    -1, // Will be set when item is updated
+		messageID:    -1,
 		dateLabel:    dateLabel,
 		senderLabel:  senderLabel,
 		subjectLabel: subjectLabel,
-		hbox:         hbox,
+		content:      content,
 		background:   background,
 		isSelected:   false,
 	}
@@ -349,15 +421,14 @@ type messageListItemRenderer struct {
 
 func (r *messageListItemRenderer) Layout(size fyne.Size) {
 	r.item.background.Resize(size)
-	r.item.hbox.Resize(size)
+	r.item.content.Resize(size)
 }
 
 func (r *messageListItemRenderer) MinSize() fyne.Size {
-	return r.item.hbox.MinSize()
+	return r.item.content.MinSize()
 }
 
 func (r *messageListItemRenderer) Refresh() {
-	// Update background visibility and color based on selection state
 	if r.item.isSelected {
 		r.item.background.FillColor = theme.Color(theme.ColorNameSelection)
 		r.item.background.Show()
@@ -365,11 +436,11 @@ func (r *messageListItemRenderer) Refresh() {
 		r.item.background.Hide()
 	}
 	r.item.background.Refresh()
-	r.item.hbox.Refresh()
+	r.item.content.Refresh()
 }
 
 func (r *messageListItemRenderer) Objects() []fyne.CanvasObject {
-	return []fyne.CanvasObject{r.item.background, r.item.hbox}
+	return []fyne.CanvasObject{r.item.background, r.item.content}
 }
 
 func (r *messageListItemRenderer) Destroy() {
@@ -968,13 +1039,13 @@ func (mw *MainWindow) setupUI() {
 
 	// Date column (fixed width to match message date display)
 	dateHeaderContainer := container.NewWithoutLayout(mw.dateHeaderBtn)
-	dateHeaderContainer.Resize(fyne.NewSize(100, 32))
-	mw.dateHeaderBtn.Resize(fyne.NewSize(100, 32))
+	dateHeaderContainer.Resize(fyne.NewSize(messageDateColumnWidth, 32))
+	mw.dateHeaderBtn.Resize(fyne.NewSize(messageDateColumnWidth, 32))
 
 	// Sender column (fixed width to match message sender display)
 	senderHeaderContainer := container.NewWithoutLayout(mw.senderHeaderBtn)
-	senderHeaderContainer.Resize(fyne.NewSize(150, 32))
-	mw.senderHeaderBtn.Resize(fyne.NewSize(150, 32))
+	senderHeaderContainer.Resize(fyne.NewSize(messageSenderColumnWidth, 32))
+	mw.senderHeaderBtn.Resize(fyne.NewSize(messageSenderColumnWidth, 32))
 
 	// Create the header layout using border to give subject remaining space
 	leftSide := container.NewHBox(dateHeaderContainer, senderHeaderContainer)
@@ -3219,21 +3290,24 @@ func (mw *MainWindow) createImagePreview(attachment email.Attachment, attachment
 		return widget.NewLabel("Failed to create image resource")
 	}
 
-	// Create image widget with proper sizing for preview
+	maxWidth := float32(600)
+	maxHeight := float32(400)
+
 	imageWidget := canvas.NewImageFromResource(resource)
-	imageWidget.FillMode = canvas.ImageFillContain
+	imageWidget.FillMode = canvas.ImageFillCover
+	imageWidget.CornerRadius = theme.Size(theme.SizeNameSelectionRadius) * 2
 
-	// Set reasonable constraints for the preview - max width of message viewer, reasonable height
-	maxWidth := float32(600)  // Maximum width for the preview
-	maxHeight := float32(400) // Maximum height for the preview
+	previewSize := fyne.NewSize(maxWidth, maxHeight)
+	imageWidget.SetMinSize(previewSize)
+	imageWidget.Resize(previewSize)
 
-	// Set both minimum and actual size to ensure the image is visible
-	imageWidget.Resize(fyne.NewSize(maxWidth, maxHeight))
-	imageWidget.SetMinSize(fyne.NewSize(maxWidth, maxHeight))
+	background := canvas.NewRectangle(theme.Color(theme.ColorNameInputBackground))
+	background.CornerRadius = imageWidget.CornerRadius
+	background.SetMinSize(previewSize)
+	background.Resize(previewSize)
 
-	// Create a container that properly displays the image
-	// Use a border container with the image in the center to ensure proper display
-	imageContainer := container.NewBorder(nil, nil, nil, nil, imageWidget)
+	card := container.NewStack(background, imageWidget)
+	imageContainer := container.NewCenter(card)
 
 	// Create a button to view full size
 	viewFullSizeBtn := widget.NewButton("View Full Size", func() {

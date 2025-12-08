@@ -103,7 +103,7 @@ func TestParseMultipartMessage_InlineContent(t *testing.T) {
 
 	// Simulate a multipart message where content was incorrectly treated as attachment
 	// This is similar to the issue shown in the screenshot
-	rawMessage := `From: Josh Grebe <josh@example.com>
+	rawMessage := `From: Josh <josh@example.com>
 To: user@example.com
 Subject: photos
 Date: September 17, 2025 at 1:04 PM

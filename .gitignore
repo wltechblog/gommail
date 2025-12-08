@@ -67,8 +67,7 @@ docs
 traces
 *.log
 mail-test
-docs
 
-gommail
+/gommail
 error.txt
 .zencoder
