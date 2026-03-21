@@ -158,6 +158,132 @@ func TestHTMLToMarkdown_Links(t *testing.T) {
 	}
 }
 
+func TestHTMLToMarkdown_LinkTextThatIsURLStaysClickable(t *testing.T) {
+	mockMgr := newMockAttachmentManager()
+	mvc := NewMessageViewController(mockMgr, true)
+
+	html := `<p><a href="https://example.com/path">https://example.com/path</a></p>`
+	result := mvc.HTMLToMarkdown(html)
+
+	if !strings.Contains(result, "[example.com/path](https://example.com/path)") {
+		t.Errorf("Result should contain clickable markdown link, got: %s", result)
+	}
+}
+
+func TestHTMLToMarkdown_LinkifiesBareURLsInTextNodes(t *testing.T) {
+	mockMgr := newMockAttachmentManager()
+	mvc := NewMessageViewController(mockMgr, true)
+
+	html := `<p>See https://example.com/docs for details.</p>`
+	result := mvc.HTMLToMarkdown(html)
+
+	if !strings.Contains(result, "[example.com/docs](https://example.com/docs)") {
+		t.Errorf("Result should contain linkified bare URL, got: %s", result)
+	}
+	if !strings.Contains(result, "for details") {
+		t.Errorf("Result should retain surrounding text, got: %s", result)
+	}
+}
+
+func TestHTMLToMarkdown_BlockquoteFormatting(t *testing.T) {
+	mockMgr := newMockAttachmentManager()
+	mvc := NewMessageViewController(mockMgr, true)
+
+	html := `<p>Hello</p><blockquote><p>On Tue, Jane wrote:</p><p>Quoted line</p></blockquote>`
+	result := mvc.HTMLToMarkdown(html)
+
+	if !strings.Contains(result, "> On Tue, Jane wrote:") {
+		t.Errorf("Result should include quoted header line, got: %s", result)
+	}
+	if !strings.Contains(result, "> Quoted line") {
+		t.Errorf("Result should include quoted body line, got: %s", result)
+	}
+}
+
+func TestHTMLToMarkdown_ListSpacing(t *testing.T) {
+	mockMgr := newMockAttachmentManager()
+	mvc := NewMessageViewController(mockMgr, true)
+
+	html := `<p>Steps:</p><ul><li>First</li><li>Second</li></ul><p>Done</p>`
+	result := mvc.HTMLToMarkdown(html)
+
+	if !strings.Contains(result, "Steps:\n\n- First") {
+		t.Errorf("Result should separate paragraph from list, got: %q", result)
+	}
+	if !strings.Contains(result, "- Second") {
+		t.Errorf("Result should include second list item, got: %q", result)
+	}
+	if !strings.Contains(result, "Second\n\nDone") {
+		t.Errorf("Result should separate list from following paragraph, got: %q", result)
+	}
+}
+
+func TestHTMLToMarkdown_ShortensLongTrackingURLLabels(t *testing.T) {
+	mockMgr := newMockAttachmentManager()
+	mvc := NewMessageViewController(mockMgr, true)
+
+	html := `<p><a href="https://tracking.example.com/e/c/01k5cpe2dv22wfqq4pjkbfrg7p/01k5cpe2dv22wfqq4pjnqm9mep?utm_source=test">https://tracking.example.com/e/c/01k5cpe2dv22wfqq4pjkbfrg7p/01k5cpe2dv22wfqq4pjnqm9mep?utm_source=test</a></p>`
+	result := mvc.HTMLToMarkdown(html)
+
+	if !strings.Contains(result, "[tracking.example.com/e/c/…](https://tracking.example.com/e/c/01k5cpe2dv22wfqq4pjkbfrg7p/01k5cpe2dv22wfqq4pjnqm9mep?utm_source=test)") {
+		t.Errorf("Result should shorten long URL label while keeping target, got: %s", result)
+	}
+}
+
+func TestHTMLToMarkdown_GmailQuoteWrapper(t *testing.T) {
+	mockMgr := newMockAttachmentManager()
+	mvc := NewMessageViewController(mockMgr, true)
+
+	html := `<div>Hello</div><div class="gmail_quote"><div class="gmail_attr">On Tue, Jane wrote:</div><blockquote><div>Quoted line</div></blockquote></div>`
+	result := mvc.HTMLToMarkdown(html)
+
+	if !strings.Contains(result, "> On Tue, Jane wrote:") {
+		t.Errorf("Result should render gmail reply header as quoted text, got: %s", result)
+	}
+	if !strings.Contains(result, "> Quoted line") {
+		t.Errorf("Result should render gmail quoted body, got: %s", result)
+	}
+	if strings.Contains(result, "> > On Tue, Jane wrote:") {
+		t.Errorf("Result should not double-quote gmail reply header, got: %s", result)
+	}
+}
+
+func TestHTMLToMarkdown_OriginalMessageSeparator(t *testing.T) {
+	mockMgr := newMockAttachmentManager()
+	mvc := NewMessageViewController(mockMgr, true)
+
+	html := `<div>Hello</div><div>-----Original Message-----</div><div id="divRplyFwdMsg"><div>From: Jane Example</div><div>Subject: Status</div><div>Quoted line</div></div>`
+	result := mvc.HTMLToMarkdown(html)
+
+	if !strings.Contains(result, "---") {
+		t.Errorf("Result should include a separator, got: %s", result)
+	}
+	if !strings.Contains(result, "> From: Jane Example") {
+		t.Errorf("Result should render forwarded header as quoted content, got: %s", result)
+	}
+	if !strings.Contains(result, "> Subject: Status") {
+		t.Errorf("Result should render forwarded subject as quoted content, got: %s", result)
+	}
+	if !strings.Contains(result, "> Quoted line") {
+		t.Errorf("Result should render forwarded body as quoted content, got: %s", result)
+	}
+}
+
+func TestHTMLToMarkdown_OnWroteReplyHeader(t *testing.T) {
+	mockMgr := newMockAttachmentManager()
+	mvc := NewMessageViewController(mockMgr, true)
+
+	html := `<div>Hello</div><div>On Tue, Jane wrote:</div><div>Earlier message</div>`
+	result := mvc.HTMLToMarkdown(html)
+
+	if !strings.Contains(result, "---") {
+		t.Errorf("Result should separate reply header from body, got: %s", result)
+	}
+	if !strings.Contains(result, "> On Tue, Jane wrote:") {
+		t.Errorf("Result should render reply header as quote header, got: %s", result)
+	}
+}
+
 func TestHTMLToMarkdown_Headers(t *testing.T) {
 	mockMgr := newMockAttachmentManager()
 	mvc := NewMessageViewController(mockMgr, true)

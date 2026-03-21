@@ -51,6 +51,7 @@ import (
 	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+	ttwidget "github.com/dweymouth/fyne-tooltip/widget"
 	"github.com/skratchdot/open-golang/open"
 
 	"github.com/PuerkitoBio/goquery"
@@ -73,6 +74,39 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func accountCacheKey(accountName string) string {
+	return fmt.Sprintf("account_%s", accountName)
+}
+
+func accountCacheKeyCandidates(accountName string) []string {
+	primary := accountCacheKey(accountName)
+	if primary == accountName {
+		return []string{primary}
+	}
+	return []string{primary, accountName}
+}
+
+func messageViewModeButtonLabel(showHTML bool) string {
+	if showHTML {
+		return "View: Rich"
+	}
+	return "View: Plain"
+}
+
+func messageViewModeButtonTooltip(showHTML bool) string {
+	if showHTML {
+		return "Currently showing rich view. Click to switch to plain text."
+	}
+	return "Currently showing plain text. Click to switch to rich view."
+}
+
+func messageViewModeStatusText(showHTML bool) string {
+	if showHTML {
+		return "Showing rich message view"
+	}
+	return "Showing plain text message view"
 }
 
 // SortBy represents the sorting criteria for messages
@@ -154,6 +188,7 @@ type MainWindow struct {
 	dateHeaderBtn    *widget.Button
 	senderHeaderBtn  *widget.Button
 	subjectHeaderBtn *widget.Button
+	toggleViewButton *ttwidget.Button
 
 	// Message state - synchronized with controllers
 	messages        []email.MessageIndexItem
@@ -195,12 +230,18 @@ type MainWindow struct {
 	deleteOperationMutex         sync.RWMutex
 
 	// Unified inbox monitoring context
-	unifiedInboxCtx    context.Context
-	unifiedInboxCancel context.CancelFunc
+	unifiedInboxCtx      context.Context
+	unifiedInboxCancel   context.CancelFunc
+	unifiedInboxHealthMu sync.Mutex
 
 	// Global health monitoring context (works in both unified and single account modes)
 	globalHealthCtx    context.Context
 	globalHealthCancel context.CancelFunc
+
+	// Connection lifecycle guards
+	connectionLifecycleMu           sync.Mutex
+	reconnectInProgress             bool
+	currentAccountConnectInProgress bool
 
 	// Logging
 	logger *logging.Logger
@@ -734,7 +775,7 @@ func NewMainWindow(app fyne.App, cfg config.ConfigManager) *MainWindow {
 		func() {
 			// onSelectionChanged - refresh the message list UI
 			if mw.messageList != nil {
-				mw.messageList.Refresh()
+				mw.refreshMessageList()
 			}
 		},
 		func(index int) {
@@ -765,6 +806,9 @@ func NewMainWindow(app fyne.App, cfg config.ConfigManager) *MainWindow {
 	mw.messageListController.SetOnMessagesChanged(func() {
 		// Sync messages from controller to MainWindow for backward compatibility
 		mw.messages = mw.messageListController.GetMessages()
+	})
+	mw.messageListController.SetOnRefreshRequested(func() {
+		mw.refreshMessageListView()
 	})
 
 	mw.setupUI()
@@ -914,6 +958,14 @@ func (mw *MainWindow) setupUI() {
 
 	// Set up MessageViewController callback
 	mw.messageViewController.SetOnViewToggled(func(showHTML bool) {
+		fyne.Do(func() {
+			mw.showHTMLContent = showHTML
+			mw.updateMessageViewToggleButton()
+			if mw.statusBar != nil {
+				mw.statusBar.SetText(messageViewModeStatusText(showHTML))
+			}
+		})
+
 		// When view is toggled, refresh the current message display
 		if mw.selectedMessage != nil {
 			go mw.fetchAndDisplayMessage(mw.selectedMessage)
@@ -953,7 +1005,7 @@ func (mw *MainWindow) setupUI() {
 	clearCacheWithTooltip := CreateTooltipButtonWithIcon("", "Clear cache and refresh", theme.ViewRefreshIcon(), func() {
 		mw.clearCache()
 	})
-	toggleHTMLWithTooltip := CreateTooltipButtonWithIcon("", "Toggle HTML/text view", theme.DocumentIcon(), func() {
+	mw.toggleViewButton = CreateTooltipButtonWithIcon(messageViewModeButtonLabel(mw.messageViewController.IsShowingHTML()), messageViewModeButtonTooltip(mw.messageViewController.IsShowingHTML()), theme.DocumentIcon(), func() {
 		mw.toggleHTMLView()
 	})
 	saveAttachmentsWithTooltip := CreateTooltipButtonWithIcon("", "Save all attachments", theme.DocumentSaveIcon(), func() {
@@ -985,7 +1037,7 @@ func (mw *MainWindow) setupUI() {
 		forwardWithTooltip,
 		widget.NewSeparator(),
 		clearCacheWithTooltip,
-		toggleHTMLWithTooltip,
+		mw.toggleViewButton,
 		saveAttachmentsWithTooltip,
 		deleteWithTooltip,
 		widget.NewSeparator(),
@@ -1080,6 +1132,7 @@ func (mw *MainWindow) setupUI() {
 	// Wrap content with tooltip layer
 	contentWithTooltips := AddTooltipLayer(content, mw.window.Canvas())
 	mw.window.SetContent(contentWithTooltips)
+	mw.updateMessageViewToggleButton()
 
 	// Set up keyboard shortcuts
 	mw.setupKeyboardShortcuts()
@@ -1089,6 +1142,19 @@ func (mw *MainWindow) setupUI() {
 func (mw *MainWindow) setupKeyboardShortcuts() {
 	// Keyboard shortcuts are registered in registerKeyboardShortcuts() method
 	mw.registerKeyboardShortcuts()
+}
+
+func (mw *MainWindow) updateMessageViewToggleButton() {
+	if mw.toggleViewButton == nil || mw.messageViewController == nil {
+		return
+	}
+
+	showHTML := mw.messageViewController.IsShowingHTML()
+	mw.showHTMLContent = showHTML
+	mw.toggleViewButton.SetText(messageViewModeButtonLabel(showHTML))
+	mw.toggleViewButton.SetToolTip(messageViewModeButtonTooltip(showHTML))
+	mw.toggleViewButton.Refresh()
+	canvas.Refresh(mw.toggleViewButton)
 }
 
 // setupMessageListContextMenu sets up the right-click context menu for the message list
@@ -1370,6 +1436,7 @@ func (mw *MainWindow) clearAccountState() {
 // selectAccount handles account selection and connects to the email server
 func (mw *MainWindow) selectAccount(account *config.Account) {
 	mw.logger.Info("Selecting account: %s (%s)", account.Name, account.Email)
+	oldClient := mw.imapClient
 
 	mw.accountController.SetCurrentAccount(account)
 	mw.statusBar.SetText(fmt.Sprintf("Connecting to %s...", account.Name))
@@ -1383,7 +1450,7 @@ func (mw *MainWindow) selectAccount(account *config.Account) {
 
 	// Refresh UI components to show the cleared state
 	mw.messageList.UnselectAll()
-	mw.messageList.Refresh()
+	mw.refreshMessageList()
 	mw.updateMessageViewer("")
 	if folderList := mw.folderController.GetFolderList(); folderList != nil {
 		folderList.UnselectAll()
@@ -1392,36 +1459,27 @@ func (mw *MainWindow) selectAccount(account *config.Account) {
 	// Cancel any active read timer when switching accounts
 	mw.cancelReadTimer()
 
-	// Create worker-based IMAP client with cache
-	mw.logger.Debug("Creating worker-based IMAP client for %s (host: %s:%d, TLS: %v)",
-		account.Name, account.IMAP.Host, account.IMAP.Port, account.IMAP.TLS)
-	imapConfig := email.ServerConfig{
-		Host:     account.IMAP.Host,
-		Port:     account.IMAP.Port,
-		Username: account.IMAP.Username,
-		Password: account.IMAP.Password,
-		TLS:      account.IMAP.TLS,
-	}
-	// Use account name as cache key to separate different accounts
-	accountKey := fmt.Sprintf("account_%s", account.Name)
-
-	// Get tracing configuration and create tracer if enabled
-	var tracer io.Writer
-	tracingConfig := mw.config.GetTracing()
-	if tracingConfig.IMAP.Enabled {
-		// Import the trace package
-		imapTracer := trace.NewIMAPTracer(true, tracingConfig.IMAP.Directory)
-		tracer = imapTracer.GetAccountTracer(account.Name)
-	}
-
-	mw.imapClient = imap.NewClientWrapperWithCacheAndTracer(imapConfig, mw.cache, accountKey, tracer)
-
-	// Start the worker
-	if err := mw.imapClient.Start(); err != nil {
-		mw.logger.Error("Failed to start IMAP worker for account %s: %v", account.Name, err)
+	newClient, needsConnect, err := mw.prepareIMAPClientForAccountSelection(account)
+	if err != nil {
+		mw.logger.Error("Failed to prepare IMAP client for account %s: %v", account.Name, err)
 		mw.statusBar.SetText(fmt.Sprintf("Failed to start IMAP worker for %s", account.Name))
 		return
 	}
+
+	// Clean up the previous single-account client if it differs from the selected account client.
+	// This avoids leaking extra workers while still allowing reuse of an already-managed client.
+	if oldClient != nil && oldClient != newClient {
+		mw.logger.Debug("Cleaning up previous IMAP client before switching to account: %s", account.Name)
+		if err := oldClient.Disconnect(); err != nil {
+			mw.logger.Warn("Failed to disconnect previous IMAP client while switching accounts: %v", err)
+		}
+		oldClient.Stop()
+		if mw.imapClient == oldClient {
+			mw.imapClient = nil
+		}
+	}
+
+	mw.imapClient = newClient
 
 	// Create SMTP client
 	mw.logger.Debug("Creating SMTP client for %s (host: %s:%d, TLS: %v)",
@@ -1437,8 +1495,8 @@ func (mw *MainWindow) selectAccount(account *config.Account) {
 
 	// IMMEDIATELY load cached folders for instant UI responsiveness
 	// Access cache directly to avoid waiting for worker connection
-	cachedFolders := mw.loadCachedFoldersDirectly(account.Name)
-	if len(cachedFolders) > 0 {
+	cachedFolders, cachedFoldersFound := mw.loadCachedFoldersDirectly(account.Name)
+	if cachedFoldersFound {
 		sortedFolders := mw.folderController.SortFolders(cachedFolders)
 		mw.folderController.SetFolders(sortedFolders)
 		mw.statusBar.SetText(fmt.Sprintf("Loaded %d folders from cache - connecting...", len(cachedFolders)))
@@ -1457,12 +1515,11 @@ func (mw *MainWindow) selectAccount(account *config.Account) {
 		mw.statusBar.SetText(fmt.Sprintf("Connecting to %s...", account.Name))
 	}
 
-	// Now connect and sync folder subscriptions in background
-	go func() {
-
-		// Set up connection state callback before connecting
-		mw.imapClient.SetConnectionStateCallback(func(event email.ConnectionEvent) {
-			// Convert email.ConnectionEvent to imap.ConnectionEvent for compatibility with existing handler
+	// If a connected managed client already exists for this account, reuse it instead of
+	// spawning a duplicate worker-backed client.
+	if !needsConnect {
+		mw.logger.Info("Reusing existing connected IMAP client for account: %s", account.Name)
+		newClient.SetConnectionStateCallback(func(event email.ConnectionEvent) {
 			imapEvent := imap.ConnectionEvent{
 				State:   imap.ConnectionState(event.State),
 				Error:   event.Error,
@@ -1471,46 +1528,116 @@ func (mw *MainWindow) selectAccount(account *config.Account) {
 			mw.handleConnectionStateChange(account.Name, imapEvent)
 		})
 
+		if cachedFoldersFound {
+			mw.statusBar.SetText(fmt.Sprintf("Connected to %s - using cached folders", account.Name))
+		} else {
+			mw.statusBar.SetText(fmt.Sprintf("Connected to %s - syncing folder subscriptions", account.Name))
+			mw.syncFolderSubscriptionsInBackground(account.Name, newClient)
+		}
+		return
+	}
+
+	mw.setCurrentAccountConnectInProgress(true)
+
+	// Now connect and optionally sync folder subscriptions in background
+	go func(client *imap.ClientWrapper, selectedAccount *config.Account, usedCachedFolders bool) {
+		defer mw.setCurrentAccountConnectInProgress(false)
+
+		// Set up connection state callback before connecting
+		client.SetConnectionStateCallback(func(event email.ConnectionEvent) {
+			// Convert email.ConnectionEvent to imap.ConnectionEvent for compatibility with existing handler
+			imapEvent := imap.ConnectionEvent{
+				State:   imap.ConnectionState(event.State),
+				Error:   event.Error,
+				Attempt: event.Attempt,
+			}
+			mw.handleConnectionStateChange(selectedAccount.Name, imapEvent)
+		})
+
 		// Now connect to server and refresh data in background
-		err := mw.imapClient.Connect()
+		err := client.Connect()
 		if err != nil {
 			fyne.Do(func() {
-				mw.statusBar.SetText(fmt.Sprintf("Failed to connect to %s: %v", account.Name, err))
+				mw.statusBar.SetText(fmt.Sprintf("Failed to connect to %s: %v", selectedAccount.Name, err))
 			})
 			return
 		}
 
 		// Clean up cached data for unsubscribed folders on startup
 		// This ensures the cache stays clean even if previous cleanup operations were missed
-		mw.logger.Debug("Performing startup cleanup of unsubscribed folder cache for account: %s", account.Name)
-		if cleanupErr := mw.imapClient.CleanupUnsubscribedFolderCache(); cleanupErr != nil {
-			mw.logger.Warn("Failed to cleanup unsubscribed folder cache for %s: %v", account.Name, cleanupErr)
+		mw.logger.Debug("Performing startup cleanup of unsubscribed folder cache for account: %s", selectedAccount.Name)
+		if cleanupErr := client.CleanupUnsubscribedFolderCache(); cleanupErr != nil {
+			mw.logger.Warn("Failed to cleanup unsubscribed folder cache for %s: %v", selectedAccount.Name, cleanupErr)
 			// Don't fail the connection for cleanup errors, just log them
 		} else {
-			mw.logger.Debug("Successfully cleaned up unsubscribed folder cache for account: %s", account.Name)
+			mw.logger.Debug("Successfully cleaned up unsubscribed folder cache for account: %s", selectedAccount.Name)
 		}
 
 		// Subscribe to default folders (INBOX, Sent, Drafts, Trash) for new accounts
 		// This is done after connection but before folder refresh to ensure subscriptions are in place
-		mw.logger.Debug("Attempting to subscribe to default folders for account: %s", account.Name)
-		if err := mw.imapClient.SubscribeToDefaultFolders(account.SentFolder, account.TrashFolder); err != nil {
-			mw.logger.Warn("Failed to subscribe to some default folders for %s: %v", account.Name, err)
+		mw.logger.Debug("Attempting to subscribe to default folders for account: %s", selectedAccount.Name)
+		if err := client.SubscribeToDefaultFolders(selectedAccount.SentFolder, selectedAccount.TrashFolder); err != nil {
+			mw.logger.Warn("Failed to subscribe to some default folders for %s: %v", selectedAccount.Name, err)
 			// Don't fail the connection for subscription errors, just log them
 		} else {
-			mw.logger.Info("Successfully subscribed to default folders for account: %s", account.Name)
+			mw.logger.Info("Successfully subscribed to default folders for account: %s", selectedAccount.Name)
+		}
+
+		if usedCachedFolders {
+			fyne.Do(func() {
+				mw.statusBar.SetText(fmt.Sprintf("Connected to %s - using cached folders", selectedAccount.Name))
+			})
+			return
 		}
 
 		// Sync folder subscriptions in background and update UI if changes are detected
-		mw.syncFolderSubscriptionsInBackground(account.Name)
+		mw.syncFolderSubscriptionsInBackground(selectedAccount.Name, client)
 
 		fyne.Do(func() {
-			mw.statusBar.SetText(fmt.Sprintf("Connected to %s - syncing folder subscriptions", account.Name))
+			mw.statusBar.SetText(fmt.Sprintf("Connected to %s - syncing folder subscriptions", selectedAccount.Name))
 		})
-	}()
+	}(newClient, account, cachedFoldersFound)
+}
+
+func (mw *MainWindow) prepareIMAPClientForAccountSelection(account *config.Account) (*imap.ClientWrapper, bool, error) {
+	if client, exists := mw.accountController.GetIMAPClientForAccount(account.Name); exists && client != nil {
+		if client.IsConnected() {
+			mw.logger.Debug("Reusing existing managed IMAP client for selected account: %s", account.Name)
+			return client, false, nil
+		}
+
+		mw.logger.Debug("Managed IMAP client for account %s is disconnected, recreating it", account.Name)
+		mw.accountController.CloseClientForAccount(account.Name)
+	}
+
+	mw.logger.Debug("Creating worker-based IMAP client for %s (host: %s:%d, TLS: %v)",
+		account.Name, account.IMAP.Host, account.IMAP.Port, account.IMAP.TLS)
+	imapConfig := email.ServerConfig{
+		Host:     account.IMAP.Host,
+		Port:     account.IMAP.Port,
+		Username: account.IMAP.Username,
+		Password: account.IMAP.Password,
+		TLS:      account.IMAP.TLS,
+	}
+
+	var tracer io.Writer
+	tracingConfig := mw.config.GetTracing()
+	if tracingConfig.IMAP.Enabled {
+		imapTracer := trace.NewIMAPTracer(true, tracingConfig.IMAP.Directory)
+		tracer = imapTracer.GetAccountTracer(account.Name)
+	}
+
+	client := imap.NewClientWrapperWithCacheAndTracer(imapConfig, mw.cache, accountCacheKey(account.Name), tracer)
+	if err := client.Start(); err != nil {
+		return nil, false, fmt.Errorf("failed to start IMAP worker for %s: %w", account.Name, err)
+	}
+
+	mw.accountController.StoreIMAPClient(account.Name, client)
+	return client, true, nil
 }
 
 // syncFolderSubscriptionsInBackground syncs folder subscriptions with server and updates UI if changes detected
-func (mw *MainWindow) syncFolderSubscriptionsInBackground(accountName string) {
+func (mw *MainWindow) syncFolderSubscriptionsInBackground(accountName string, client *imap.ClientWrapper) {
 	go func() {
 		mw.logger.Debug("Starting background folder subscription sync for account: %s", accountName)
 
@@ -1520,13 +1647,13 @@ func (mw *MainWindow) syncFolderSubscriptionsInBackground(accountName string) {
 		copy(currentFoldersCopy, currentFolders)
 
 		// Start background refresh of folders (this will update cache with subscribed folders)
-		mw.imapClient.RefreshFoldersInBackground()
+		client.RefreshFoldersInBackground()
 
 		// Wait a moment for background refresh to complete
 		time.Sleep(2 * time.Second)
 
 		// Get updated subscribed folders from cache
-		updatedFolders, err := mw.imapClient.ListSubscribedFolders()
+		updatedFolders, err := client.ListSubscribedFolders()
 		if err != nil {
 			mw.logger.Warn("Failed to get updated folders after sync: %v", err)
 			return
@@ -1555,15 +1682,26 @@ func (mw *MainWindow) foldersChanged(current, updated []email.Folder) bool {
 	return mw.folderController.FoldersChanged(current, updated)
 }
 
-// selectUnifiedInbox handles unified inbox selection and loads messages from all accounts
+// selectUnifiedInbox handles unified inbox selection by showing cached data first
+// while reconnecting and refreshing in the background.
 func (mw *MainWindow) selectUnifiedInbox() {
+	mw.selectUnifiedInboxWithOptions(false)
+}
+
+// selectUnifiedInboxWithOptions handles unified inbox selection and can optionally
+// force a fresh refresh for explicit reload paths.
+func (mw *MainWindow) selectUnifiedInboxWithOptions(forceRefresh bool) {
 	mw.logger.Info("Selecting unified inbox")
 
 	// Set unified inbox state
 	mw.accountController.SetUnifiedInbox(true)
 	mw.accountController.ClearCurrentAccount()
 	mw.folderController.SelectFolder("") // Clear current folder
-	mw.statusBar.SetText("Loading unified inbox...")
+	if forceRefresh {
+		mw.statusBar.SetText("Refreshing unified inbox...")
+	} else {
+		mw.statusBar.SetText("Loading unified inbox...")
+	}
 
 	// Clear current selection and message viewer (but keep messages until new ones load)
 	mw.selectedMessage = nil
@@ -1586,23 +1724,66 @@ func (mw *MainWindow) selectUnifiedInbox() {
 	}
 
 	// Load unified messages (don't clear messages array until new ones are ready)
-	go mw.loadUnifiedInboxMessages()
+	go mw.loadUnifiedInboxMessages(forceRefresh)
 }
 
-// loadUnifiedInboxMessages loads messages from all accounts' INBOX folders
-func (mw *MainWindow) loadUnifiedInboxMessages() {
-	mw.logger.Info("Loading unified inbox messages from all accounts")
+func (mw *MainWindow) startUnifiedInboxMonitoringFromConnectedClients() {
+	connectedClientCount := 0
+	mw.accountController.ForEachClient(func(accountName string, client *imap.ClientWrapper) {
+		if client == nil || !client.IsConnected() {
+			return
+		}
 
-	// Show loading state immediately
-	fyne.Do(func() {
-		mw.messages = []email.MessageIndexItem{}
-		mw.messageList.UnselectAll()
-		mw.messageList.Refresh()
-		mw.statusBar.SetText("Loading messages from all accounts...")
+		client.MarkInitialSyncComplete("INBOX")
+		connectedClientCount++
 	})
 
+	if connectedClientCount > 0 {
+		mw.logger.Info("Starting unified inbox monitoring from %d already-connected account clients", connectedClientCount)
+		mw.startUnifiedInboxMonitoring()
+	}
+}
+
+// loadUnifiedInboxMessages loads messages from all accounts' INBOX folders.
+// It always works toward a live connected unified inbox, but displays cached data
+// immediately when available so the UI is responsive.
+func (mw *MainWindow) loadUnifiedInboxMessages(forceRefresh bool) {
+	mw.logger.Info("Loading unified inbox messages from all accounts (forceRefresh=%v)", forceRefresh)
+
+	// Try cached unified inbox messages first for immediate display.
+	cachedMessages, cachedMessagesFound := mw.loadUnifiedInboxFromCache()
+	if cachedMessagesFound {
+		fyne.Do(func() {
+			if !mw.accountController.IsUnifiedInbox() {
+				mw.logger.Debug("User switched away from unified inbox before cached load completed")
+				return
+			}
+
+			mw.messages = cachedMessages
+			mw.sortMessages()
+			mw.messageList.UnselectAll()
+			mw.refreshMessageList()
+			mw.statusBar.SetText(fmt.Sprintf("Loaded %d cached messages from unified inbox (checking for updates...)", len(mw.messages)))
+		})
+	} else {
+		// Show loading state immediately when cache is unavailable.
+		fyne.Do(func() {
+			mw.messages = []email.MessageIndexItem{}
+			mw.messageList.UnselectAll()
+			mw.refreshMessageList()
+			mw.statusBar.SetText("Loading messages from all accounts...")
+		})
+	}
+
+	// Start monitoring immediately for any accounts that are already connected,
+	// then continue the full background refresh which will connect remaining
+	// accounts and refresh the unified inbox contents.
+	if !forceRefresh {
+		mw.startUnifiedInboxMonitoringFromConnectedClients()
+	}
+
 	// Fetch fresh messages in background and wait for ALL accounts to complete
-	// before displaying anything - this avoids race conditions and partial updates
+	// before replacing the unified mailbox contents.
 	go mw.fetchFreshUnifiedInboxMessagesInBackground()
 }
 
@@ -1738,7 +1919,7 @@ func (mw *MainWindow) fetchFreshUnifiedInboxMessagesInBackground() {
 
 			// Force the list to update by clearing selection and refreshing
 			mw.messageList.UnselectAll()
-			mw.messageList.Refresh()
+			mw.refreshMessageList()
 
 			mw.logger.Info("Refreshed message list with %d total messages", len(mw.messages))
 
@@ -1850,7 +2031,7 @@ func (mw *MainWindow) refreshSingleAccountInUnifiedInbox(accountName string) {
 
 			// Force the list to update
 			mw.messageList.UnselectAll()
-			mw.messageList.Refresh()
+			mw.refreshMessageList()
 
 			mw.statusBar.SetText(fmt.Sprintf("Added %d new messages from %s", addedCount, accountName))
 		} else {
@@ -1905,83 +2086,75 @@ func (mw *MainWindow) mergeNewMessagesIntoUnifiedInbox(newMessages []email.Messa
 }
 
 // loadUnifiedInboxFromCache loads unified inbox messages from cache
-func (mw *MainWindow) loadUnifiedInboxFromCache() []email.MessageIndexItem {
+func (mw *MainWindow) loadUnifiedInboxFromCache() ([]email.MessageIndexItem, bool) {
+	if mw.cache == nil || mw.config == nil {
+		return nil, false
+	}
+
 	var allMessages []email.MessageIndexItem
+	cacheFound := false
 
 	accounts := mw.config.GetAccounts()
 	for _, account := range accounts {
-		// Try to get cached messages for this account's INBOX
-		// Use the same cache key format as ClientWrapper: accountKey:messages:folder
-		accountKey := fmt.Sprintf("account_%s", account.Name)
-		cacheKey := fmt.Sprintf("%s:messages:INBOX", accountKey)
-		if cachedData, found, err := mw.cache.Get(cacheKey); err == nil && found {
-			var messages []email.Message
-			if err := json.Unmarshal(cachedData, &messages); err == nil {
-				// Convert to MessageIndexItem with proper IMAP client assignment
-				for _, msg := range messages {
-					// Get or create IMAP client for this account
-					var imapClient *imap.ClientWrapper
-					if existingClient, exists := mw.accountController.GetIMAPClientForAccount(account.Name); exists && existingClient != nil {
-						imapClient = existingClient
-					} else {
-						// Create IMAP client wrapper for this account
-						imapConfig := email.ServerConfig{
-							Host:     account.IMAP.Host,
-							Port:     account.IMAP.Port,
-							Username: account.IMAP.Username,
-							Password: account.IMAP.Password,
-							TLS:      account.IMAP.TLS,
-						}
-						accountKey := fmt.Sprintf("account_%s", account.Name)
-						imapClient = imap.NewClientWrapperWithCache(imapConfig, mw.cache, accountKey)
-						mw.accountController.StoreIMAPClient(account.Name, imapClient)
-					}
+		messages, found := mw.loadCachedMessagesDirectly(account.Name, "INBOX")
+		if !found {
+			continue
+		}
 
-					// Create SMTP client for this account (lightweight, no connection)
-					smtpClient := smtp.NewClient(email.ServerConfig{
+		cacheFound = true
+
+		// Use an already-connected client if one exists; otherwise leave IMAPClient nil
+		// so selecting a cached message can connect lazily on demand.
+		var imapClient *imap.ClientWrapper
+		if existingClient, exists := mw.accountController.GetIMAPClientForAccount(account.Name); exists && existingClient != nil && existingClient.IsConnected() {
+			imapClient = existingClient
+		}
+
+		// Create SMTP client for this account (lightweight, no connection)
+		smtpClient := smtp.NewClient(email.ServerConfig{
+			Host:     account.SMTP.Host,
+			Port:     account.SMTP.Port,
+			Username: account.SMTP.Username,
+			Password: account.SMTP.Password,
+			TLS:      account.SMTP.TLS,
+		})
+
+		for _, msg := range messages {
+			indexItem := email.MessageIndexItem{
+				Message:      msg,
+				AccountName:  account.Name,
+				AccountEmail: account.Email,
+				FolderName:   "INBOX",
+				IMAPClient:   imapClient,
+				SMTPClient:   smtpClient,
+				AccountConfig: &email.AccountConfig{
+					Name:        account.Name,
+					Email:       account.Email,
+					DisplayName: account.DisplayName,
+					IMAP: email.ServerConfig{
+						Host:     account.IMAP.Host,
+						Port:     account.IMAP.Port,
+						Username: account.IMAP.Username,
+						Password: account.IMAP.Password,
+						TLS:      account.IMAP.TLS,
+					},
+					SMTP: email.ServerConfig{
 						Host:     account.SMTP.Host,
 						Port:     account.SMTP.Port,
 						Username: account.SMTP.Username,
 						Password: account.SMTP.Password,
 						TLS:      account.SMTP.TLS,
-					})
-
-					indexItem := email.MessageIndexItem{
-						Message:      msg,
-						AccountName:  account.Name,
-						AccountEmail: account.Email,
-						FolderName:   "INBOX",
-						IMAPClient:   imapClient, // Use the actual IMAP client for this account
-						SMTPClient:   smtpClient,
-						AccountConfig: &email.AccountConfig{
-							Name:        account.Name,
-							Email:       account.Email,
-							DisplayName: account.DisplayName,
-							IMAP: email.ServerConfig{
-								Host:     account.IMAP.Host,
-								Port:     account.IMAP.Port,
-								Username: account.IMAP.Username,
-								Password: account.IMAP.Password,
-								TLS:      account.IMAP.TLS,
-							},
-							SMTP: email.ServerConfig{
-								Host:     account.SMTP.Host,
-								Port:     account.SMTP.Port,
-								Username: account.SMTP.Username,
-								Password: account.SMTP.Password,
-								TLS:      account.SMTP.TLS,
-							},
-						},
-					}
-					allMessages = append(allMessages, indexItem)
-				}
-				mw.logger.Debug("Loaded %d cached messages from account %s INBOX", len(messages), account.Name)
+					},
+				},
 			}
+			allMessages = append(allMessages, indexItem)
 		}
+
+		mw.logger.Debug("Loaded %d cached messages from account %s INBOX for unified inbox", len(messages), account.Name)
 	}
 
 	// Don't sort here - let the UI apply user's sort preferences
-	return allMessages
+	return allMessages, cacheFound
 }
 
 // fetchFreshUnifiedInboxMessages fetches fresh messages from all accounts
@@ -2096,7 +2269,7 @@ func (mw *MainWindow) fetchFreshUnifiedInboxMessages() {
 
 		// Force the list to update by clearing selection and refreshing
 		mw.messageList.UnselectAll()
-		mw.messageList.Refresh()
+		mw.refreshMessageList()
 		mw.statusBar.SetText(fmt.Sprintf("Loaded %d messages from unified inbox", len(allMessages)))
 
 		// Try to restore selection if we had one
@@ -2198,7 +2371,7 @@ func (mw *MainWindow) getOrCreateIMAPClient(account *config.Account) (*imap.Clie
 	}
 
 	// Create new worker-based IMAP client with cache and tracing
-	client := imap.NewClientWrapperWithCacheAndTracer(serverConfig, mw.cache, account.Name, tracer)
+	client := imap.NewClientWrapperWithCacheAndTracer(serverConfig, mw.cache, accountCacheKey(account.Name), tracer)
 
 	// Start the worker
 	if err := client.Start(); err != nil {
@@ -2290,7 +2463,7 @@ func (mw *MainWindow) handleConnectionStateChange(accountName string, event imap
 				// Refresh current folder if one is selected
 				if currentFolder := mw.folderController.GetCurrentFolder(); currentFolder != "" {
 					fyne.Do(func() {
-						mw.selectFolder(currentFolder)
+						mw.selectFolderWithOptions(currentFolder, true)
 					})
 				}
 			}
@@ -2371,6 +2544,10 @@ func (mw *MainWindow) getAccountForMessage(msg *email.Message) (*config.Account,
 
 // selectFolder handles folder selection and loads messages
 func (mw *MainWindow) selectFolder(folder string) {
+	mw.selectFolderWithOptions(folder, false)
+}
+
+func (mw *MainWindow) selectFolderWithOptions(folder string, forceRefresh bool) {
 	// Check for empty folder name
 	if folder == "" {
 		mw.logger.Warn("Cannot select folder: folder name is empty")
@@ -2403,13 +2580,13 @@ func (mw *MainWindow) selectFolder(folder string) {
 		// Try to select INBOX as a fallback
 		for _, f := range folders {
 			if f.Name == "INBOX" {
-				mw.selectFolder("INBOX")
+				mw.selectFolderWithOptions("INBOX", forceRefresh)
 				return
 			}
 		}
 		// If no INBOX, select the first available folder
 		if len(folders) > 0 {
-			mw.selectFolder(folders[0].Name)
+			mw.selectFolderWithOptions(folders[0].Name, forceRefresh)
 			return
 		}
 		// No folders available
@@ -2441,7 +2618,8 @@ func (mw *MainWindow) selectFolder(folder string) {
 	// Cancel any active read timer when switching folders
 	mw.cancelReadTimer()
 
-	// Load messages using simplified cache-then-fetch pattern
+	// Load messages using a cache-first pattern. Regular selection stops at the
+	// cache for instant display, while refresh paths can force a server sync.
 	go func() {
 		// Prevent concurrent fresh fetches
 		if mw.freshFetchInProgress {
@@ -2455,8 +2633,8 @@ func (mw *MainWindow) selectFolder(folder string) {
 
 		// First, try to load from cache directly for immediate display
 		mw.logger.Debug("Loading cached messages from folder %s", folder)
-		cachedMessages := mw.loadCachedMessagesDirectly(mw.accountController.GetCurrentAccount().Name, folder)
-		if len(cachedMessages) > 0 {
+		cachedMessages, cachedMessagesFound := mw.loadCachedMessagesDirectly(mw.accountController.GetCurrentAccount().Name, folder)
+		if cachedMessagesFound {
 			mw.logger.Debug("Found %d cached messages for folder %s", len(cachedMessages), folder)
 			fyne.Do(func() {
 				mw.messages = mw.convertMessagesToIndexItems(cachedMessages, folder)
@@ -2464,12 +2642,33 @@ func (mw *MainWindow) selectFolder(folder string) {
 
 				// Force the list to update by clearing selection and refreshing
 				mw.messageList.UnselectAll()
-				mw.messageList.Refresh()
+				mw.refreshMessageList()
 
-				mw.statusBar.SetText(fmt.Sprintf("Loaded %d cached messages from %s (checking for updates...)", len(cachedMessages), folder))
+				mw.updateFolderMessageCount(folder, len(cachedMessages))
+
+				if forceRefresh {
+					mw.statusBar.SetText(fmt.Sprintf("Loaded %d cached messages from %s (checking for updates...)", len(cachedMessages), folder))
+				} else {
+					mw.statusBar.SetText(fmt.Sprintf("Loaded %d cached messages from %s", len(cachedMessages), folder))
+				}
+
+				if !mw.autoSelectionDone && len(mw.messages) > 0 {
+					mw.logger.Debug("Auto-selecting first cached message")
+					mw.messageList.Select(0)
+					mw.selectMessage(0)
+					mw.autoSelectionDone = true
+				}
 			})
 		} else {
 			mw.logger.Debug("No cached messages found for folder %s, will fetch from server", folder)
+		}
+
+		if cachedMessagesFound && !forceRefresh {
+			if mw.imapClient != nil && mw.imapClient.IsConnected() {
+				mw.imapClient.MarkInitialSyncComplete(folder)
+				mw.startFolderMonitoring(folder)
+			}
+			return
 		}
 
 		// Then fetch fresh messages from server
@@ -2484,7 +2683,7 @@ func (mw *MainWindow) selectFolder(folder string) {
 						mw.statusBar.SetText(fmt.Sprintf("Failed to load messages from %s: %v", folder, err))
 						mw.messages = []email.MessageIndexItem{}
 						mw.messageList.UnselectAll()
-						mw.messageList.Refresh()
+						mw.refreshMessageList()
 					} else {
 						mw.statusBar.SetText(fmt.Sprintf("Using cached messages (%d) - server unavailable", len(mw.messages)))
 					}
@@ -2495,13 +2694,16 @@ func (mw *MainWindow) selectFolder(folder string) {
 			// Success! Update UI with fresh messages
 			mw.logger.Debug("Successfully fetched %d fresh messages from folder %s", len(messages), folder)
 			fyne.Do(func() {
-				oldCount := len(mw.messages)
+				oldCount := 0
+				if cachedMessagesFound {
+					oldCount = len(cachedMessages)
+				}
 				mw.messages = mw.convertMessagesToIndexItems(messages, folder)
 				mw.sortMessages()
 
 				// Force the list to update by clearing selection and refreshing
 				mw.messageList.UnselectAll()
-				mw.messageList.Refresh()
+				mw.refreshMessageList()
 
 				newCount := len(messages)
 				mw.updateFolderMessageCount(folder, newCount)
@@ -2654,17 +2856,19 @@ func (mw *MainWindow) selectMessage(id widget.ListItemID) {
 	// Refresh the message list to update selection highlighting (if available)
 	// Force immediate UI update by ensuring this runs on the UI thread
 	if mw.messageList != nil {
+		selectionRefreshStarted := time.Now()
+
 		// Refresh the previously selected item to remove its highlight
 		if previouslySelectedIndex >= 0 && previouslySelectedIndex < len(mw.messages) {
 			mw.messageList.RefreshItem(previouslySelectedIndex)
 		}
 
 		// Refresh the newly selected item to show its highlight
-		mw.messageList.RefreshItem(id)
+		if previouslySelectedIndex != id {
+			mw.messageList.RefreshItem(id)
+		}
 
-		// Force a full list refresh to ensure all items update their selection state
-		// This is necessary because RefreshItem alone may not trigger immediate visual updates
-		mw.messageList.Refresh()
+		mw.logger.Debug("selectMessage: refreshed selection highlights in %v", time.Since(selectionRefreshStarted))
 	}
 
 	// Cancel any existing read timer when switching messages
@@ -2816,21 +3020,13 @@ func (mw *MainWindow) fetchAndDisplayMessage(indexItem *email.MessageIndexItem) 
 
 			fyne.Do(func() {
 				// Update the message in our list with the full content
-				messageUpdated := false
 				for i := range mw.messages {
 					if mw.messages[i].Message.UID == msg.UID {
 						mw.messages[i].Message.Body = fullMsg.Body
 						mw.messages[i].Message.Attachments = fullMsg.Attachments
 						mw.logger.Debug("Updated message in array at index %d", i)
-						messageUpdated = true
 						break
 					}
-				}
-
-				// Refresh the message list if we updated message content
-				if messageUpdated {
-					mw.messageList.Refresh()
-					mw.logger.Debug("Refreshed message list after updating message content")
 				}
 
 				// Display the full message only if it's still the selected message
@@ -3118,10 +3314,22 @@ func (mw *MainWindow) performSingleMoveToFolder(msg *email.MessageIndexItem, fol
 	return msg.MoveTo(folderName)
 }
 
-// refreshMessageList refreshes the message list display
-// Delegates to MessageListController
+// refreshMessageListView refreshes both the visible wrapper widget and the inner
+// Fyne list so changes appear immediately without requiring user interaction.
+func (mw *MainWindow) refreshMessageListView() {
+	if mw.messageList != nil {
+		mw.messageList.Refresh()
+		canvas.Refresh(mw.messageList)
+	}
+	if mw.messageListWithRightClick != nil {
+		mw.messageListWithRightClick.Refresh()
+		canvas.Refresh(mw.messageListWithRightClick)
+	}
+}
+
+// refreshMessageList refreshes the message list display.
 func (mw *MainWindow) refreshMessageList() {
-	mw.messageListController.RefreshMessageList()
+	mw.refreshMessageListView()
 }
 
 // deleteMessagesMultiple permanently deletes all selected messages
@@ -4358,7 +4566,7 @@ func (mw *MainWindow) moveToTrash() {
 				mw.messageList.UnselectAll()
 
 				// Force the message list to refresh with new length
-				mw.messageList.Refresh()
+				mw.refreshMessageList()
 				mw.logger.Debug("Forced message list refresh after removal (new length: %d)", len(mw.messages))
 
 				// Auto-select next message if we have messages remaining
@@ -4494,7 +4702,7 @@ func (mw *MainWindow) performDelete() {
 				mw.messageList.UnselectAll()
 
 				// Force the message list to refresh with new length
-				mw.messageList.Refresh()
+				mw.refreshMessageList()
 				mw.logger.Debug("Forced message list refresh after deletion (new length: %d)", len(mw.messages))
 
 				// Clear the message display since no message is selected
@@ -5040,7 +5248,7 @@ func (mw *MainWindow) performMoveToFolder(targetFolder string) {
 		fyne.Do(func() {
 			mw.selectedMessage = nil
 			if mw.messageList != nil {
-				mw.messageList.Refresh() // Update highlighting
+				mw.refreshMessageList() // Update highlighting
 			}
 		})
 
@@ -5242,7 +5450,7 @@ func (mw *MainWindow) performCacheClear() {
 		// If unified inbox was selected, reload it
 		mw.logger.Info("Reloading unified inbox after cache clear")
 		fyne.Do(func() {
-			mw.selectUnifiedInbox()
+			mw.selectUnifiedInboxWithOptions(true)
 		})
 	} else {
 		// No account selected, just update status
@@ -5282,7 +5490,7 @@ func (mw *MainWindow) clearInMemoryData() {
 
 	// Refresh UI to show cleared state
 	mw.messageList.UnselectAll()
-	mw.messageList.Refresh()
+	mw.refreshMessageList()
 	if folderList := mw.folderController.GetFolderList(); folderList != nil {
 		folderList.Refresh()
 	}
@@ -5294,56 +5502,66 @@ func (mw *MainWindow) clearInMemoryData() {
 
 // loadCachedFoldersDirectly loads folders directly from cache without going through the worker
 // This provides instant UI responsiveness when switching accounts
-func (mw *MainWindow) loadCachedFoldersDirectly(accountName string) []email.Folder {
+func (mw *MainWindow) loadCachedFoldersDirectly(accountName string) ([]email.Folder, bool) {
 	if mw.cache == nil {
-		return nil
+		return nil, false
 	}
 
-	// Use the same cache key format as the worker
-	accountKey := fmt.Sprintf("account_%s", accountName)
-	cacheKey := fmt.Sprintf("%s:folders:subscribed", accountKey)
+	for _, accountKey := range accountCacheKeyCandidates(accountName) {
+		cacheKey := fmt.Sprintf("%s:folders:subscribed", accountKey)
+		data, found, err := mw.cache.Get(cacheKey)
+		if err != nil {
+			mw.logger.Debug("Failed loading cached folders for account %s from key %s: %v", accountName, cacheKey, err)
+			continue
+		}
+		if !found {
+			continue
+		}
 
-	data, found, err := mw.cache.Get(cacheKey)
-	if err != nil || !found {
-		mw.logger.Debug("No cached folders found for account %s: found=%t, err=%v", accountName, found, err)
-		return nil
+		var folders []email.Folder
+		if err := json.Unmarshal(data, &folders); err != nil {
+			mw.logger.Warn("Failed to unmarshal cached folders for account %s from key %s: %v", accountName, cacheKey, err)
+			continue
+		}
+
+		mw.logger.Debug("Loaded %d folders directly from cache for account %s using key %s", len(folders), accountName, cacheKey)
+		return folders, true
 	}
 
-	var folders []email.Folder
-	if err := json.Unmarshal(data, &folders); err != nil {
-		mw.logger.Warn("Failed to unmarshal cached folders for account %s: %v", accountName, err)
-		return nil
-	}
-
-	mw.logger.Debug("Loaded %d folders directly from cache for account %s", len(folders), accountName)
-	return folders
+	mw.logger.Debug("No cached folders found for account %s", accountName)
+	return nil, false
 }
 
 // loadCachedMessagesDirectly loads messages directly from cache without going through the worker
 // This provides instant UI responsiveness when switching folders
-func (mw *MainWindow) loadCachedMessagesDirectly(accountName, folder string) []email.Message {
+func (mw *MainWindow) loadCachedMessagesDirectly(accountName, folder string) ([]email.Message, bool) {
 	if mw.cache == nil {
-		return nil
+		return nil, false
 	}
 
-	// Use the same cache key format as the worker
-	accountKey := fmt.Sprintf("account_%s", accountName)
-	cacheKey := fmt.Sprintf("%s:messages:%s", accountKey, folder)
+	for _, accountKey := range accountCacheKeyCandidates(accountName) {
+		cacheKey := fmt.Sprintf("%s:messages:%s", accountKey, folder)
+		data, found, err := mw.cache.Get(cacheKey)
+		if err != nil {
+			mw.logger.Debug("Failed loading cached messages for account %s, folder %s from key %s: %v", accountName, folder, cacheKey, err)
+			continue
+		}
+		if !found {
+			continue
+		}
 
-	data, found, err := mw.cache.Get(cacheKey)
-	if err != nil || !found {
-		mw.logger.Debug("No cached messages found for account %s, folder %s: found=%t, err=%v", accountName, folder, found, err)
-		return nil
+		var messages []email.Message
+		if err := json.Unmarshal(data, &messages); err != nil {
+			mw.logger.Warn("Failed to unmarshal cached messages for account %s, folder %s from key %s: %v", accountName, folder, cacheKey, err)
+			continue
+		}
+
+		mw.logger.Debug("Loaded %d messages directly from cache for account %s, folder %s using key %s", len(messages), accountName, folder, cacheKey)
+		return messages, true
 	}
 
-	var messages []email.Message
-	if err := json.Unmarshal(data, &messages); err != nil {
-		mw.logger.Warn("Failed to unmarshal cached messages for account %s, folder %s: %v", accountName, folder, err)
-		return nil
-	}
-
-	mw.logger.Debug("Loaded %d messages directly from cache for account %s, folder %s", len(messages), accountName, folder)
-	return messages
+	mw.logger.Debug("No cached messages found for account %s, folder %s", accountName, folder)
+	return nil, false
 }
 
 // preloadAccountCaches preloads folder and message caches for all accounts in background
@@ -5359,13 +5577,13 @@ func (mw *MainWindow) preloadAccountCaches() {
 
 		for _, account := range accounts {
 			// Check if we have cached folders for this account
-			cachedFolders := mw.loadCachedFoldersDirectly(account.Name)
-			if len(cachedFolders) > 0 {
+			cachedFolders, cachedFoldersFound := mw.loadCachedFoldersDirectly(account.Name)
+			if cachedFoldersFound {
 				mw.logger.Debug("Account %s has %d cached folders", account.Name, len(cachedFolders))
 
 				// Check if we have cached messages for INBOX
-				cachedMessages := mw.loadCachedMessagesDirectly(account.Name, "INBOX")
-				if len(cachedMessages) > 0 {
+				cachedMessages, cachedMessagesFound := mw.loadCachedMessagesDirectly(account.Name, "INBOX")
+				if cachedMessagesFound {
 					mw.logger.Debug("Account %s has %d cached INBOX messages", account.Name, len(cachedMessages))
 				}
 			}
@@ -5634,7 +5852,7 @@ func (mw *MainWindow) setupNewAccountAutomatically(account *config.Account) {
 				mw.statusBar.SetText("Refreshing unified inbox...")
 				// Invalidate cache to ensure fresh data is loaded
 				mw.invalidateUnifiedInboxCache()
-				go mw.loadUnifiedInboxMessages()
+				go mw.loadUnifiedInboxMessages(true)
 			} else {
 				// Select the new account to show its folders and messages
 				mw.logger.Info("Selecting new account %s", account.Name)
@@ -5691,7 +5909,7 @@ func (mw *MainWindow) showAddAccountWizard() {
 
 				if mw.accountController.IsUnifiedInbox() {
 					mw.invalidateUnifiedInboxCache()
-					go mw.loadUnifiedInboxMessages()
+					go mw.loadUnifiedInboxMessages(true)
 				}
 			}
 		}
@@ -6235,7 +6453,7 @@ func (mw *MainWindow) markMessageAsRead(msg *email.Message) error {
 		}
 
 		// Refresh the message list to update the bold text styling
-		mw.messageList.Refresh()
+		mw.refreshMessageList()
 	})
 
 	return nil
@@ -6444,7 +6662,7 @@ func (mw *MainWindow) handleDeletedFolder(deletedFolder string) {
 
 		// Update UI
 		fyne.Do(func() {
-			mw.messageList.Refresh()
+			mw.refreshMessageList()
 			mw.updateMessageViewer("")
 
 			// Delegate to FolderController to handle folder selection
@@ -6558,8 +6776,15 @@ func (mw *MainWindow) startUnifiedInboxMonitoring() {
 	allAccountsHealthyMonitoring := true
 	activeMonitoringCount := 0
 	healthyMonitoringCount := 0
+	connectedClientCount := 0
 
 	mw.accountController.ForEachClient(func(accountName string, client *imap.ClientWrapper) {
+		if client == nil || !client.IsConnected() {
+			allAccountsHealthyMonitoring = false
+			return
+		}
+
+		connectedClientCount++
 		isMonitoring := client.IsMonitoring()
 		if isMonitoring {
 			activeMonitoringCount++
@@ -6577,6 +6802,11 @@ func (mw *MainWindow) startUnifiedInboxMonitoring() {
 		}
 	})
 	// Unlock handled by AccountController
+
+	if connectedClientCount == 0 {
+		mw.logger.Debug("No connected account clients available for unified inbox monitoring")
+		return
+	}
 
 	// Only skip restart if all accounts are monitoring AND all connections are healthy
 	if allAccountsHealthyMonitoring && healthyMonitoringCount > 0 {
@@ -6600,6 +6830,10 @@ func (mw *MainWindow) startUnifiedInboxMonitoring() {
 	// Start monitoring for each account's INBOX
 	monitoringCount := 0
 	mw.accountController.ForEachClient(func(accountName string, client *imap.ClientWrapper) {
+		if client == nil || !client.IsConnected() {
+			mw.logger.Debug("Skipping unified inbox monitoring for disconnected account %s", accountName)
+			return
+		}
 
 		// Set up connection state callback for error handling (capture accountName properly)
 		func(capturedAccountName string) {
@@ -6697,13 +6931,9 @@ func (mw *MainWindow) startUnifiedInboxMonitoring() {
 			}
 		})
 
-		// Start connection health monitoring
-		if mw.unifiedInboxCtx == nil {
-			ctx, cancel := context.WithCancel(context.Background())
-			mw.unifiedInboxCtx = ctx
-			mw.unifiedInboxCancel = cancel
-		}
-		go mw.monitorConnectionHealth(mw.unifiedInboxCtx)
+		// Start a fresh unified inbox health monitor. Repeated calls to
+		// startUnifiedInboxMonitoring() should not leave multiple monitors running.
+		mw.restartUnifiedInboxHealthMonitoring()
 	}
 }
 
@@ -6749,6 +6979,69 @@ func (mw *MainWindow) stopGlobalHealthMonitoring() {
 	}
 }
 
+func (mw *MainWindow) restartUnifiedInboxHealthMonitoring() {
+	mw.unifiedInboxHealthMu.Lock()
+	defer mw.unifiedInboxHealthMu.Unlock()
+
+	if mw.unifiedInboxCancel != nil {
+		mw.unifiedInboxCancel()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	mw.unifiedInboxCtx = ctx
+	mw.unifiedInboxCancel = cancel
+
+	go mw.monitorConnectionHealth(ctx)
+}
+
+func (mw *MainWindow) stopUnifiedInboxHealthMonitoring() {
+	mw.unifiedInboxHealthMu.Lock()
+	defer mw.unifiedInboxHealthMu.Unlock()
+
+	if mw.unifiedInboxCancel != nil {
+		mw.unifiedInboxCancel()
+		mw.unifiedInboxCancel = nil
+		mw.unifiedInboxCtx = nil
+		mw.logger.Debug("Stopped unified inbox connection health monitoring")
+	}
+}
+
+func (mw *MainWindow) setCurrentAccountConnectInProgress(inProgress bool) {
+	mw.connectionLifecycleMu.Lock()
+	defer mw.connectionLifecycleMu.Unlock()
+	mw.currentAccountConnectInProgress = inProgress
+}
+
+func (mw *MainWindow) isCurrentAccountConnectInProgress() bool {
+	mw.connectionLifecycleMu.Lock()
+	defer mw.connectionLifecycleMu.Unlock()
+	return mw.currentAccountConnectInProgress
+}
+
+func (mw *MainWindow) beginCurrentAccountReconnect(accountName string) bool {
+	mw.connectionLifecycleMu.Lock()
+	defer mw.connectionLifecycleMu.Unlock()
+
+	if mw.currentAccountConnectInProgress {
+		mw.logger.Debug("Skipping reconnect for current account %s because account connection is already in progress", accountName)
+		return false
+	}
+
+	if mw.reconnectInProgress {
+		mw.logger.Debug("Reconnect already in progress for current account %s, skipping duplicate attempt", accountName)
+		return false
+	}
+
+	mw.reconnectInProgress = true
+	return true
+}
+
+func (mw *MainWindow) endCurrentAccountReconnect() {
+	mw.connectionLifecycleMu.Lock()
+	defer mw.connectionLifecycleMu.Unlock()
+	mw.reconnectInProgress = false
+}
+
 // performHealthChecks checks the health of all account connections
 func (mw *MainWindow) performHealthChecks() {
 	unhealthyAccounts := 0
@@ -6776,6 +7069,12 @@ func (mw *MainWindow) performHealthChecks() {
 	} else {
 		// In single account mode, check the current account
 		if mw.accountController.GetCurrentAccount() != nil && mw.imapClient != nil {
+			if mw.isCurrentAccountConnectInProgress() {
+				accountName := mw.accountController.GetCurrentAccount().Name
+				mw.logger.Debug("Skipping health check for current account %s while account connection is in progress", accountName)
+				return
+			}
+
 			totalAccounts = 1
 			accountName := mw.accountController.GetCurrentAccount().Name
 
@@ -6818,11 +7117,17 @@ func (mw *MainWindow) restartAccountMonitoring(accountName string, client *imap.
 
 // reconnectCurrentAccount attempts to reconnect the current account
 func (mw *MainWindow) reconnectCurrentAccount() {
-	if mw.accountController.GetCurrentAccount() == nil {
+	account := mw.accountController.GetCurrentAccount()
+	if account == nil {
 		return
 	}
 
-	accountName := mw.accountController.GetCurrentAccount().Name
+	accountName := account.Name
+	if !mw.beginCurrentAccountReconnect(accountName) {
+		return
+	}
+	defer mw.endCurrentAccountReconnect()
+
 	mw.logger.Info("Reconnecting current account: %s", accountName)
 
 	// Update status bar
@@ -6830,8 +7135,12 @@ func (mw *MainWindow) reconnectCurrentAccount() {
 		mw.statusBar.SetText(fmt.Sprintf("Reconnecting to %s...", accountName))
 	})
 
+	// Force the cached per-account client to be recreated so we don't accidentally
+	// reuse a stale connection and then disconnect the same client we just selected.
+	mw.accountController.CloseClientForAccount(accountName)
+
 	// Create new IMAP client
-	newClient, err := mw.getOrCreateIMAPClient(mw.accountController.GetCurrentAccount())
+	newClient, err := mw.getOrCreateIMAPClient(account)
 	if err != nil {
 		mw.logger.Error("Failed to reconnect account %s: %v", accountName, err)
 		fyne.Do(func() {
@@ -6845,8 +7154,11 @@ func (mw *MainWindow) reconnectCurrentAccount() {
 	mw.imapClient = newClient
 
 	// Clean up old client
-	if oldClient != nil {
-		oldClient.Disconnect()
+	if oldClient != nil && oldClient != newClient {
+		if err := oldClient.Disconnect(); err != nil {
+			mw.logger.Warn("Failed to disconnect old IMAP client during reconnect for %s: %v", accountName, err)
+		}
+		oldClient.Stop()
 	}
 
 	// Update status bar
@@ -6859,7 +7171,7 @@ func (mw *MainWindow) reconnectCurrentAccount() {
 	if currentFolder != "" {
 		mw.logger.Info("Refreshing folder %s after reconnection", currentFolder)
 		fyne.Do(func() {
-			mw.selectFolder(currentFolder)
+			mw.selectFolderWithOptions(currentFolder, true)
 		})
 	}
 
@@ -6915,6 +7227,7 @@ func (mw *MainWindow) isClientConnectionHealthy(client *imap.ClientWrapper, acco
 // stopUnifiedInboxMonitoring stops monitoring for all accounts in unified inbox mode
 func (mw *MainWindow) stopUnifiedInboxMonitoring() {
 	mw.logger.Info("Stopping unified inbox monitoring for all accounts")
+	mw.stopUnifiedInboxHealthMonitoring()
 
 	mw.accountController.ForEachClient(func(accountName string, client *imap.ClientWrapper) {
 		if client.IsMonitoring() {
@@ -6928,6 +7241,7 @@ func (mw *MainWindow) stopUnifiedInboxMonitoring() {
 // stopUnifiedInboxMonitoringFast stops monitoring for all accounts without graceful cleanup
 func (mw *MainWindow) stopUnifiedInboxMonitoringFast() {
 	mw.logger.Debug("Force stopping unified inbox monitoring for all accounts")
+	mw.stopUnifiedInboxHealthMonitoring()
 
 	mw.accountController.ForEachClient(func(accountName string, client *imap.ClientWrapper) {
 		if client.IsMonitoring() {
@@ -6996,7 +7310,7 @@ func (mw *MainWindow) refreshMessagesDebounced(folderName string, callback func(
 		if folderName != "" && currentFolder == folderName {
 			// Re-select the current folder to trigger a refresh
 			fyne.Do(func() {
-				mw.selectFolder(folderName)
+				mw.selectFolderWithOptions(folderName, true)
 			})
 		}
 

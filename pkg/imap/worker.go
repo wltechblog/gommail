@@ -56,7 +56,8 @@ type IMAPWorker struct {
 	lastMessageCount map[string]uint32
 	lastHighestUID   map[string]uint32
 	initialSyncDone  map[string]bool
-	lastIDLEActivity time.Time // Track last time IDLE loop was confirmed running
+	lastIDLEActivity time.Time    // Track last time IDLE loop was confirmed running
+	idleUpdateCh     chan struct{} // Signalled by UnilateralDataHandler when server pushes a mailbox update
 
 	// Reconnection tracking to prevent notification spam
 	lastReconnectTime    time.Time
@@ -96,6 +97,7 @@ func NewIMAPWorker(config *email.ServerConfig, accountName, cacheKey string, cac
 		cacheKey:    cacheKey,
 		cache:       cache,
 		commandCh:   make(chan *IMAPCommand, 100), // Buffered channel for commands
+		idleUpdateCh: make(chan struct{}, 1),       // Buffered: avoids blocking the unilateral data handler
 		// stopCh and ctx will be created in Start()
 		state:                ConnectionStateDisconnected,
 		idleTimeout:          29 * time.Minute, // Default 29 minutes (RFC recommends < 30 min)
@@ -498,7 +500,12 @@ func (w *IMAPWorker) isConnectionError(err error) bool {
 
 // performComprehensiveHealthCheck performs a thorough health check of the IMAP connection
 func (w *IMAPWorker) performComprehensiveHealthCheck() (bool, error) {
-	if w.commandClient == nil {
+	// commandClient can be set to nil concurrently (e.g. force disconnect / reconnect).
+	// Capture a stable reference for this health check to avoid nil dereference.
+	w.mu.RLock()
+	client := w.commandClient
+	w.mu.RUnlock()
+	if client == nil {
 		return false, fmt.Errorf("command client not available")
 	}
 
@@ -513,10 +520,19 @@ func (w *IMAPWorker) performComprehensiveHealthCheck() (bool, error) {
 	done := make(chan error, 1)
 
 	// Perform NOOP in a goroutine with timeout
-	go func() {
-		noopCmd := w.commandClient.Noop()
+	go func(c *imapclient.Client) {
+		// c may be closed, but should never be nil here. If it is, fail gracefully.
+		if c == nil {
+			done <- fmt.Errorf("command client not available")
+			return
+		}
+		noopCmd := c.Noop()
+		if noopCmd == nil {
+			done <- fmt.Errorf("NOOP command returned nil")
+			return
+		}
 		done <- noopCmd.Wait()
-	}()
+	}(client)
 
 	// Wait for completion or timeout
 	select {
@@ -867,14 +883,57 @@ func (w *IMAPWorker) handleConnect(cmd *IMAPCommand) *IMAPResponse {
 		return NewResponse(cmd.ID, false, nil, fmt.Errorf("command client creation failed: %w", err))
 	}
 
-	// Create IDLE client
-	idleClient, err := createClient("IDLE")
+	// Create IDLE client with a UnilateralDataHandler so the server's unsolicited
+	// EXISTS/EXPUNGE responses during IDLE are delivered immediately rather than
+	// only being noticed when the 29-minute timeout fires.
+	w.logger.Debug("Creating IDLE client connection")
+	idleOptions := &imapclient.Options{
+		TLSConfig: tlsConfig,
+		UnilateralDataHandler: &imapclient.UnilateralDataHandler{
+			Mailbox: func(data *imapclient.UnilateralDataMailbox) {
+				// Server pushed a mailbox update (e.g. * N EXISTS) while we are IDLing.
+				// NumMessages being non-nil means the message count changed, which is
+				// the primary indicator that new mail has arrived.
+				if data.NumMessages != nil {
+					w.logger.Debug("IDLE: server pushed mailbox update (NumMessages=%d), signalling check",
+						*data.NumMessages)
+					// Non-blocking send: if a signal is already pending we don't need
+					// another one – the monitor loop will check for new messages anyway.
+					select {
+					case w.idleUpdateCh <- struct{}{}:
+					default:
+					}
+				}
+			},
+		},
+	}
+	if w.tracer != nil {
+		idleOptions.DebugWriter = w.tracer
+		w.logger.Debug("IMAP tracing enabled for IDLE client")
+	}
+
+	var idleClient *imapclient.Client
+	if config.TLS {
+		idleClient, err = imapclient.DialTLS(fmt.Sprintf("%s:%d", config.Host, config.Port), idleOptions)
+	} else {
+		idleClient, err = imapclient.DialStartTLS(fmt.Sprintf("%s:%d", config.Host, config.Port), idleOptions)
+	}
 	if err != nil {
-		commandClient.Close() // Clean up command client
-		w.logger.Error("Failed to create IDLE client: %v", err)
+		commandClient.Close()
+		w.logger.Error("Failed to connect IDLE client: %v", err)
 		w.setState(ConnectionStateFailed, err)
 		w.incrementErrorCount()
 		return NewResponse(cmd.ID, false, nil, fmt.Errorf("IDLE client creation failed: %w", err))
+	}
+	if config.Username != "" && config.Password != "" {
+		if err := idleClient.Login(config.Username, config.Password).Wait(); err != nil {
+			idleClient.Close()
+			commandClient.Close()
+			w.logger.Error("Failed to authenticate IDLE client: %v", err)
+			w.setState(ConnectionStateFailed, err)
+			w.incrementErrorCount()
+			return NewResponse(cmd.ID, false, nil, fmt.Errorf("IDLE client authentication failed: %w", err))
+		}
 	}
 
 	// Store clients and update state
@@ -1028,11 +1087,16 @@ func (w *IMAPWorker) handleGetStatus(cmd *IMAPCommand) *IMAPResponse {
 func (w *IMAPWorker) handleRefreshFoldersInBackground(cmd *IMAPCommand) *IMAPResponse {
 	w.logger.Debug("Handling refresh folders in background command")
 
+	// Capture a stable client reference for the background goroutine.
+	w.mu.RLock()
+	client := w.commandClient
+	w.mu.RUnlock()
+
 	// This is a fire-and-forget operation, so we return success immediately
 	// and do the actual work in a goroutine
-	go func() {
+	go func(c *imapclient.Client) {
 		// Only proceed if we're connected
-		if w.commandClient == nil {
+		if c == nil {
 			w.logger.Debug("Not connected, skipping background folder refresh")
 			return
 		}
@@ -1040,7 +1104,7 @@ func (w *IMAPWorker) handleRefreshFoldersInBackground(cmd *IMAPCommand) *IMAPRes
 		w.logger.Debug("Starting background folder refresh")
 
 		// Refresh subscribed folders from server and update cache
-		listCmd := w.commandClient.List("", "*", &imap.ListOptions{
+		listCmd := c.List("", "*", &imap.ListOptions{
 			SelectSubscribed: true,
 		})
 		mailboxes, err := listCmd.Collect()
@@ -1067,7 +1131,7 @@ func (w *IMAPWorker) handleRefreshFoldersInBackground(cmd *IMAPCommand) *IMAPRes
 		} else {
 			w.logger.Debug("Successfully refreshed and cached %d folders in background", len(folders))
 		}
-	}()
+	}(client)
 
 	// Return success immediately since this is fire-and-forget
 	return NewResponse(cmd.ID, true, map[string]interface{}{
@@ -1360,40 +1424,56 @@ func (w *IMAPWorker) handleFetchMessages(cmd *IMAPCommand) *IMAPResponse {
 		w.mu.Unlock()
 	}
 
-	// Build search criteria for fetching messages
+	// Use UID SEARCH so we get stable UIDs, not volatile sequence numbers.
+	// Sequence numbers shift whenever a message is expunged: a concurrent
+	// expunge between SEARCH and FETCH can make the sequence-number set
+	// invalid, causing servers like Dovecot to return
+	// "BAD Error in IMAP command FETCH: Invalid messageset".
+	// UIDs are permanent identifiers; a UID FETCH for a missing UID simply
+	// returns no data instead of an error.
 	searchCriteria := &imap.SearchCriteria{}
 
-	// Search for all messages
-	searchCmd := w.commandClient.Search(searchCriteria, nil)
+	searchCmd := w.commandClient.UIDSearch(searchCriteria, nil)
 	searchData, err := searchCmd.Wait()
 	if err != nil {
-		w.logger.Error("Failed to search messages in folder %s: %v", folderName, err)
+		w.logger.Error("Failed to UID SEARCH messages in folder %s: %v", folderName, err)
 		w.incrementErrorCount()
 		return NewResponse(cmd.ID, false, nil, fmt.Errorf("failed to search messages: %w", err))
 	}
 
-	// Get sequence numbers from search results
-	seqNums := searchData.AllSeqNums()
-	if len(seqNums) == 0 {
+	uids := searchData.AllUIDs()
+	if len(uids) == 0 {
 		w.logger.Debug("No messages found in folder: %s", folderName)
 		return NewResponse(cmd.ID, true, map[string]interface{}{
 			DataMessages: []email.Message{},
 		}, nil)
 	}
 
-	// Apply limit if specified (get most recent messages)
-	if limit > 0 && len(seqNums) > limit {
-		seqNums = seqNums[len(seqNums)-limit:]
+	// Apply limit if specified (get most recent messages; UIDs are ascending)
+	if limit > 0 && len(uids) > limit {
+		uids = uids[len(uids)-limit:]
 	}
 
-	// Create sequence set for fetching
-	seqSet := imap.SeqSet{}
-	for _, seqNum := range seqNums {
-		seqSet.AddNum(seqNum)
+	// Build a compact UID range for the fetch command.
+	//
+	// Expressing the request as a single "minUID:maxUID" range keeps the IMAP
+	// command argument short regardless of how many messages are in the folder
+	// or how fragmented the UID space is.  Listing every UID individually via
+	// AddNum can produce a multi-kilobyte argument string for large or heavily-
+	// pruned mailboxes, causing servers like Dovecot to reject the command with
+	// "BAD Too long argument".
+	//
+	// UID FETCH silently returns no data for UIDs that no longer exist (e.g.
+	// expunged messages), so any gaps within the range are completely harmless.
+	// UIDs returned by UIDSearch are already sorted ascending, so uids[0] is
+	// the smallest and uids[len-1] is the largest.
+	uidSet := imap.UIDSet{}
+	if len(uids) > 0 {
+		uidSet.AddRange(uids[0], uids[len(uids)-1])
 	}
 
-	// Fetch message envelopes and flags
-	fetchCmd := w.commandClient.Fetch(seqSet, &imap.FetchOptions{
+	// Fetch message envelopes and flags via UID FETCH
+	fetchCmd := w.commandClient.Fetch(uidSet, &imap.FetchOptions{
 		Envelope:     true,
 		Flags:        true,
 		UID:          true,
@@ -1626,10 +1706,12 @@ func (w *IMAPWorker) stopIDLEInternal() {
 		w.idleCancel()
 	}
 
-	// Close the IDLE command
+	// Close the IDLE command. idleCancel() above may have already caused the
+	// idleMonitorLoop goroutine to call idleCmd.Close(); the library's atomic
+	// guard returns "already closed" in that race, which is expected and harmless.
 	if w.idleCmd != nil {
 		if err := w.idleCmd.Close(); err != nil {
-			w.logger.Warn("Error closing IDLE command: %v", err)
+			w.logger.Debug("IDLE close in stopIDLEInternal (may be harmless if goroutine closed first): %v", err)
 		}
 	}
 
@@ -1718,6 +1800,17 @@ func (w *IMAPWorker) idleMonitorLoop(ctx context.Context, idleCmd *imapclient.Id
 	}()
 
 	select {
+	case <-w.idleUpdateCh:
+		// The server pushed a mailbox update (e.g. * N EXISTS) via the UnilateralDataHandler
+		// while we were IDLing. Terminate IDLE immediately, check for new messages, then restart.
+		w.logger.Debug("IDLE: received server push notification for folder: %s, terminating IDLE to fetch updates", folder)
+		if err := idleCmd.Close(); err != nil {
+			// "already closed" can occur if stopIDLEInternal also called Close; treat as non-fatal.
+			w.logger.Debug("IDLE close after server push (may be harmless): %v", err)
+		}
+		<-done // Wait for idleCmd.Wait() (server OK to DONE) to complete before any new command.
+		w.checkForNewMessages(folder)
+
 	case <-ctx.Done():
 		// Timeout or context cancellation
 		contextErr := ctx.Err()
@@ -1729,7 +1822,8 @@ func (w *IMAPWorker) idleMonitorLoop(ctx context.Context, idleCmd *imapclient.Id
 
 		// Close the IDLE command
 		if err := idleCmd.Close(); err != nil {
-			w.logger.Warn("Error closing IDLE command: %v", err)
+			// Suppress "already closed" - stopIDLEInternal may have beaten us here.
+			w.logger.Debug("IDLE close on ctx.Done() (may be harmless): %v", err)
 		}
 		<-done // Wait for the command to actually finish
 
@@ -1884,9 +1978,12 @@ func (w *IMAPWorker) checkForNewMessages(folder string) {
 	lastReconnectTime := w.lastReconnectTime
 	gracePeriod := w.reconnectGracePeriod
 
-	// Update tracking data
+	// Always advance the message-count watermark so we don't re-trigger on the
+	// same EXISTS count change. We deliberately defer updating lastHighestUID
+	// until after a successful fetch: some servers (e.g. Gmail) push EXISTS
+	// before the message is actually fetchable. If fetchNewMessages returns 0,
+	// leaving lastHighestUID at its old value lets the next IDLE cycle retry.
 	w.lastMessageCount[folder] = currentMessageCount
-	w.lastHighestUID[folder] = currentHighestUID
 	w.mu.Unlock()
 
 	// Save tracking state to cache when it changes
@@ -1901,6 +1998,10 @@ func (w *IMAPWorker) checkForNewMessages(folder string) {
 		if inGracePeriod {
 			w.logger.Debug("Suppressing new message notifications for folder %s (in %v grace period after reconnection, %v elapsed)",
 				folder, gracePeriod, timeSinceReconnect)
+			// Advance UID watermark so we don't re-trigger after the grace period.
+			w.mu.Lock()
+			w.lastHighestUID[folder] = currentHighestUID
+			w.mu.Unlock()
 			return
 		}
 
@@ -1909,7 +2010,10 @@ func (w *IMAPWorker) checkForNewMessages(folder string) {
 		if lastCount == 0 && lastUID == 0 && currentMessageCount > 100 {
 			w.logger.Warn("Detected potential tracking state reset for folder %s (count jumped from 0 to %d). Suppressing notifications to prevent flood.",
 				folder, currentMessageCount)
-			// Update tracking state without triggering notifications
+			// Advance UID watermark to avoid replaying the flood on reconnect.
+			w.mu.Lock()
+			w.lastHighestUID[folder] = currentHighestUID
+			w.mu.Unlock()
 			return
 		}
 
@@ -1918,25 +2022,44 @@ func (w *IMAPWorker) checkForNewMessages(folder string) {
 
 		// Fetch the new messages
 		newMessages := w.fetchNewMessages(folder, lastUID, currentHighestUID)
-		if len(newMessages) > 0 && w.onNewMessage != nil {
-			// Additional safety check: limit the number of notifications sent at once
-			maxNotifications := 10
-			notificationMessages := newMessages
-			if len(newMessages) > maxNotifications {
-				w.logger.Warn("Limiting notifications to %d messages (found %d new messages) to prevent spam",
-					maxNotifications, len(newMessages))
-				notificationMessages = newMessages[:maxNotifications]
-			}
+		if len(newMessages) > 0 {
+			// Advance the UID watermark now that we have confirmed the messages exist.
+			w.mu.Lock()
+			w.lastHighestUID[folder] = currentHighestUID
+			w.mu.Unlock()
+			go w.saveTrackingStateToCache()
 
-			// Create new message event
-			event := NewMessageEvent{
-				Folder:    folder,
-				Messages:  notificationMessages,
-				Count:     len(notificationMessages),
-				Timestamp: time.Now(),
+			if w.onNewMessage != nil {
+				// Additional safety check: limit the number of notifications sent at once
+				maxNotifications := 10
+				notificationMessages := newMessages
+				if len(newMessages) > maxNotifications {
+					w.logger.Warn("Limiting notifications to %d messages (found %d new messages) to prevent spam",
+						maxNotifications, len(newMessages))
+					notificationMessages = newMessages[:maxNotifications]
+				}
+
+				// Create new message event
+				event := NewMessageEvent{
+					Folder:    folder,
+					Messages:  notificationMessages,
+					Count:     len(notificationMessages),
+					Timestamp: time.Now(),
+				}
+				w.onNewMessage(event)
 			}
-			w.onNewMessage(event)
+		} else if currentHighestUID > lastUID {
+			// fetchNewMessages returned nothing despite a UID change. This typically
+			// means the server sent EXISTS before the message was fully delivered.
+			// Leave lastHighestUID at the old value so the next IDLE cycle retries.
+			w.logger.Debug("fetchNewMessages returned 0 results for folder %s (UID %d->%d); will retry on next IDLE cycle",
+				folder, lastUID, currentHighestUID)
 		}
+	} else {
+		// No new messages; advance the UID watermark to match current server state.
+		w.mu.Lock()
+		w.lastHighestUID[folder] = currentHighestUID
+		w.mu.Unlock()
 	}
 }
 
@@ -1970,7 +2093,6 @@ func (w *IMAPWorker) fetchNewMessages(folder string, lastUID, currentHighestUID 
 	}
 
 	fetchCmd := w.commandClient.Fetch(uidSet, fetchOptions)
-	defer fetchCmd.Close()
 
 	var newMessages []email.Message
 	for {
@@ -1983,6 +2105,7 @@ func (w *IMAPWorker) fetchNewMessages(folder string, lastUID, currentHighestUID 
 		newMessages = append(newMessages, emailMsg)
 	}
 
+	// Single explicit close; no defer to avoid a double-close.
 	if err := fetchCmd.Close(); err != nil {
 		w.logger.Error("Failed to fetch new messages: %v", err)
 		return nil

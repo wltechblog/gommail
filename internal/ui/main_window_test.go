@@ -1,18 +1,225 @@
 package ui
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
+	"fyne.io/fyne/v2"
+	fynetest "fyne.io/fyne/v2/test"
+	"fyne.io/fyne/v2/widget"
 	"github.com/wltechblog/gommail/internal/config"
 	"github.com/wltechblog/gommail/internal/email"
 	"github.com/wltechblog/gommail/internal/logging"
 	"github.com/wltechblog/gommail/internal/ui/controllers"
+	cachepkg "github.com/wltechblog/gommail/pkg/cache"
+	"github.com/wltechblog/gommail/pkg/imap"
 	"github.com/wltechblog/gommail/pkg/smtp"
 )
+
+func TestUnifiedInboxHealthMonitoringLifecycle(t *testing.T) {
+	mw := &MainWindow{logger: logging.NewComponent("ui-test")}
+
+	mw.restartUnifiedInboxHealthMonitoring()
+	firstCtx := mw.unifiedInboxCtx
+	if firstCtx == nil || mw.unifiedInboxCancel == nil {
+		t.Fatalf("expected unified inbox health monitoring to be initialized")
+	}
+
+	mw.restartUnifiedInboxHealthMonitoring()
+	secondCtx := mw.unifiedInboxCtx
+	if secondCtx == nil || secondCtx == firstCtx {
+		t.Fatalf("expected restart to replace the unified inbox health context")
+	}
+
+	select {
+	case <-firstCtx.Done():
+	case <-time.After(200 * time.Millisecond):
+		t.Fatalf("expected previous unified inbox health context to be cancelled")
+	}
+
+	mw.stopUnifiedInboxHealthMonitoring()
+	if mw.unifiedInboxCtx != nil || mw.unifiedInboxCancel != nil {
+		t.Fatalf("expected unified inbox health monitoring to be cleared after stop")
+	}
+
+	select {
+	case <-secondCtx.Done():
+	case <-time.After(200 * time.Millisecond):
+		t.Fatalf("expected active unified inbox health context to be cancelled on stop")
+	}
+}
+
+func TestCurrentAccountReconnectGuard(t *testing.T) {
+	mw := &MainWindow{logger: logging.NewComponent("ui-test")}
+
+	if !mw.beginCurrentAccountReconnect("shortcut") {
+		t.Fatalf("expected first reconnect attempt to start")
+	}
+
+	if mw.beginCurrentAccountReconnect("shortcut") {
+		t.Fatalf("expected overlapping reconnect attempt to be rejected")
+	}
+
+	mw.endCurrentAccountReconnect()
+
+	if !mw.beginCurrentAccountReconnect("shortcut") {
+		t.Fatalf("expected reconnect to be allowed again after finishing")
+	}
+	mw.endCurrentAccountReconnect()
+
+	mw.setCurrentAccountConnectInProgress(true)
+	defer mw.setCurrentAccountConnectInProgress(false)
+
+	if mw.beginCurrentAccountReconnect("shortcut") {
+		t.Fatalf("expected reconnect to be skipped while account connection is in progress")
+	}
+}
+
+func TestCurrentAccountConnectFlag(t *testing.T) {
+	mw := &MainWindow{logger: logging.NewComponent("ui-test")}
+
+	if mw.isCurrentAccountConnectInProgress() {
+		t.Fatalf("expected connect-in-progress flag to default to false")
+	}
+
+	mw.setCurrentAccountConnectInProgress(true)
+	if !mw.isCurrentAccountConnectInProgress() {
+		t.Fatalf("expected connect-in-progress flag to be true after set")
+	}
+
+	mw.setCurrentAccountConnectInProgress(false)
+	if mw.isCurrentAccountConnectInProgress() {
+		t.Fatalf("expected connect-in-progress flag to be false after reset")
+	}
+}
+
+func TestPrepareIMAPClientForAccountSelectionReusesManagedClient(t *testing.T) {
+	account := config.Account{
+		Name:  "Reuse Account",
+		Email: "reuse@example.com",
+		IMAP: config.ServerConfig{
+			Host:     "imap.example.com",
+			Port:     993,
+			Username: "reuse@example.com",
+			Password: "password",
+			TLS:      true,
+		},
+	}
+	mockConfig := newMockConfigManager([]config.Account{account})
+	mw := &MainWindow{
+		logger:            logging.NewComponent("ui-test"),
+		config:            mockConfig,
+		accountController: controllers.NewAccountController(mockConfig, nil),
+	}
+
+	existing := imap.NewClientWrapperWithCache(email.ServerConfig{
+		Host:     account.IMAP.Host,
+		Port:     account.IMAP.Port,
+		Username: account.IMAP.Username,
+		Password: account.IMAP.Password,
+		TLS:      account.IMAP.TLS,
+	}, nil, accountCacheKey(account.Name))
+	if err := existing.Start(); err != nil {
+		t.Fatalf("start existing managed client: %v", err)
+	}
+	defer existing.Stop()
+	setClientWrapperConnectedState(t, existing, true)
+	mw.accountController.StoreIMAPClient(account.Name, existing)
+
+	client, needsConnect, err := mw.prepareIMAPClientForAccountSelection(&account)
+	if err != nil {
+		t.Fatalf("prepare client: %v", err)
+	}
+	if needsConnect {
+		t.Fatalf("expected existing managed client to be reused without reconnect")
+	}
+	if client != existing {
+		t.Fatalf("expected reused client pointer %p, got %p", existing, client)
+	}
+}
+
+func TestPrepareIMAPClientForAccountSelectionCreatesAndStoresClient(t *testing.T) {
+	account := config.Account{
+		Name:  "Fresh Account",
+		Email: "fresh@example.com",
+		IMAP: config.ServerConfig{
+			Host:     "imap.example.com",
+			Port:     993,
+			Username: "fresh@example.com",
+			Password: "password",
+			TLS:      true,
+		},
+	}
+	mockConfig := newMockConfigManager([]config.Account{account})
+	mw := &MainWindow{
+		logger:            logging.NewComponent("ui-test"),
+		config:            mockConfig,
+		accountController: controllers.NewAccountController(mockConfig, nil),
+	}
+
+	client, needsConnect, err := mw.prepareIMAPClientForAccountSelection(&account)
+	if err != nil {
+		t.Fatalf("prepare client: %v", err)
+	}
+	defer mw.accountController.CloseClientForAccount(account.Name)
+
+	if !needsConnect {
+		t.Fatalf("expected new client to require connect")
+	}
+
+	stored, exists := mw.accountController.GetIMAPClientForAccount(account.Name)
+	if !exists || stored == nil {
+		t.Fatalf("expected prepared client to be stored in account controller")
+	}
+	if stored != client {
+		t.Fatalf("expected stored client pointer %p, got %p", client, stored)
+	}
+	if stored.IsConnected() {
+		t.Fatalf("expected newly prepared client to be started but not yet connected")
+	}
+}
+
+func setClientWrapperConnectedState(t *testing.T, client *imap.ClientWrapper, connected bool) {
+	t.Helper()
+
+	field := reflect.ValueOf(client).Elem().FieldByName("connected")
+	if !field.IsValid() {
+		t.Fatalf("client wrapper missing connected field")
+	}
+
+	state := int32(0)
+	if connected {
+		state = 1
+	}
+	atomic.StoreInt32((*int32)(unsafe.Pointer(field.UnsafeAddr())), state)
+}
+
+func TestMonitorConnectionHealthStopsWhenContextCancelled(t *testing.T) {
+	mw := &MainWindow{logger: logging.NewComponent("ui-test")}
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan struct{})
+
+	go func() {
+		defer close(finished)
+		mw.monitorConnectionHealth(ctx)
+	}()
+
+	cancel()
+
+	select {
+	case <-finished:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("expected monitorConnectionHealth to stop promptly after cancellation")
+	}
+}
 
 // TestSortMessages tests the message sorting functionality
 func TestSortMessages(t *testing.T) {
@@ -551,6 +758,46 @@ func TestUnifiedInboxMessageSelection(t *testing.T) {
 	}
 }
 
+func TestSelectMessageWithAttachedList(t *testing.T) {
+	app := fynetest.NewApp()
+	defer app.Quit()
+
+	messages := []email.MessageIndexItem{
+		{Message: email.Message{UID: 1, Subject: "First"}, AccountName: "Account1", FolderName: "INBOX"},
+		{Message: email.Message{UID: 2, Subject: "Second"}, AccountName: "Account1", FolderName: "INBOX"},
+	}
+
+	mw := &MainWindow{
+		logger:                logging.NewComponent("test"),
+		accountController:     controllers.NewAccountController(nil, nil),
+		messages:              messages,
+		messageViewController: controllers.NewMessageViewController(nil, true),
+	}
+
+	list := widget.NewList(
+		func() int { return len(mw.messages) },
+		func() fyne.CanvasObject { return widget.NewLabel("") },
+		func(id widget.ListItemID, obj fyne.CanvasObject) {
+			if id < len(mw.messages) {
+				obj.(*widget.Label).SetText(mw.messages[id].Message.Subject)
+			}
+		},
+	)
+	window := fynetest.NewWindow(list)
+	defer window.Close()
+	mw.messageList = list
+
+	mw.selectMessage(0)
+	if mw.selectedMessage == nil || mw.selectedMessage.Message.UID != 1 {
+		t.Fatalf("expected first message to be selected, got %#v", mw.selectedMessage)
+	}
+
+	mw.selectMessage(1)
+	if mw.selectedMessage == nil || mw.selectedMessage.Message.UID != 2 {
+		t.Fatalf("expected second message to be selected after refresh-item path, got %#v", mw.selectedMessage)
+	}
+}
+
 // TestMessageIndexItemSorting tests that MessageIndexItem messages are sorted correctly
 func TestMessageIndexItemSorting(t *testing.T) {
 	now := time.Now()
@@ -974,6 +1221,34 @@ func TestFormatAddresses(t *testing.T) {
 	}
 }
 
+func TestMessageViewModeButtonLabel(t *testing.T) {
+	tests := []struct {
+		showHTML bool
+		want     string
+	}{
+		{showHTML: true, want: "View: Rich"},
+		{showHTML: false, want: "View: Plain"},
+	}
+
+	for _, tt := range tests {
+		if got := messageViewModeButtonLabel(tt.showHTML); got != tt.want {
+			t.Fatalf("messageViewModeButtonLabel(%t) = %q, want %q", tt.showHTML, got, tt.want)
+		}
+	}
+}
+
+func TestMessageViewModeButtonTooltip(t *testing.T) {
+	richTooltip := messageViewModeButtonTooltip(true)
+	if !strings.Contains(richTooltip, "Currently showing rich view") || !strings.Contains(richTooltip, "plain text") {
+		t.Fatalf("unexpected rich tooltip: %q", richTooltip)
+	}
+
+	plainTooltip := messageViewModeButtonTooltip(false)
+	if !strings.Contains(plainTooltip, "Currently showing plain text") || !strings.Contains(plainTooltip, "rich view") {
+		t.Fatalf("unexpected plain tooltip: %q", plainTooltip)
+	}
+}
+
 func TestMessageListItemHighlighting(t *testing.T) {
 	// Create a test MainWindow
 	mw := &MainWindow{
@@ -1016,5 +1291,171 @@ func TestMessageListItemHighlighting(t *testing.T) {
 	item.updateContent(1, &mw.messages[1])
 	if item.isSelected {
 		t.Error("Message list item should not be selected when updating with non-selected message")
+	}
+}
+
+func TestLoadCachedFoldersDirectlyFallsBackToLegacyKey(t *testing.T) {
+	mw := &MainWindow{
+		cache:  cachepkg.New(t.TempDir(), false, 10),
+		logger: logging.NewComponent("ui-test"),
+	}
+
+	folders := []email.Folder{{Name: "INBOX"}, {Name: "Sent"}}
+	data, err := json.Marshal(folders)
+	if err != nil {
+		t.Fatalf("marshal folders: %v", err)
+	}
+
+	legacyKey := fmt.Sprintf("%s:folders:subscribed", "Legacy Account")
+	if err := mw.cache.Set(legacyKey, data, time.Hour); err != nil {
+		t.Fatalf("set legacy cache entry: %v", err)
+	}
+
+	got, found := mw.loadCachedFoldersDirectly("Legacy Account")
+	if !found {
+		t.Fatalf("expected legacy folder cache entry to be found")
+	}
+	if len(got) != len(folders) || got[0].Name != folders[0].Name || got[1].Name != folders[1].Name {
+		t.Fatalf("unexpected folders from cache: %#v", got)
+	}
+}
+
+func TestLoadCachedMessagesDirectlyPrefersPrimaryKey(t *testing.T) {
+	mw := &MainWindow{
+		cache:  cachepkg.New(t.TempDir(), false, 10),
+		logger: logging.NewComponent("ui-test"),
+	}
+
+	primaryMessages := []email.Message{{UID: 1, Subject: "primary"}}
+	legacyMessages := []email.Message{{UID: 2, Subject: "legacy"}}
+
+	primaryData, err := json.Marshal(primaryMessages)
+	if err != nil {
+		t.Fatalf("marshal primary messages: %v", err)
+	}
+	legacyData, err := json.Marshal(legacyMessages)
+	if err != nil {
+		t.Fatalf("marshal legacy messages: %v", err)
+	}
+
+	primaryKey := fmt.Sprintf("%s:messages:%s", accountCacheKey("Test Account"), "INBOX")
+	legacyKey := fmt.Sprintf("%s:messages:%s", "Test Account", "INBOX")
+	if err := mw.cache.Set(primaryKey, primaryData, time.Hour); err != nil {
+		t.Fatalf("set primary cache entry: %v", err)
+	}
+	if err := mw.cache.Set(legacyKey, legacyData, time.Hour); err != nil {
+		t.Fatalf("set legacy cache entry: %v", err)
+	}
+
+	got, found := mw.loadCachedMessagesDirectly("Test Account", "INBOX")
+	if !found {
+		t.Fatalf("expected message cache entry to be found")
+	}
+	if len(got) != 1 || got[0].Subject != "primary" {
+		t.Fatalf("expected primary cache entry, got %#v", got)
+	}
+}
+
+func TestLoadCachedMessagesDirectlyReportsEmptyCacheHit(t *testing.T) {
+	mw := &MainWindow{
+		cache:  cachepkg.New(t.TempDir(), false, 10),
+		logger: logging.NewComponent("ui-test"),
+	}
+
+	data, err := json.Marshal([]email.Message{})
+	if err != nil {
+		t.Fatalf("marshal empty messages: %v", err)
+	}
+
+	primaryKey := fmt.Sprintf("%s:messages:%s", accountCacheKey("Empty Account"), "Archive")
+	if err := mw.cache.Set(primaryKey, data, time.Hour); err != nil {
+		t.Fatalf("set empty cache entry: %v", err)
+	}
+
+	got, found := mw.loadCachedMessagesDirectly("Empty Account", "Archive")
+	if !found {
+		t.Fatalf("expected empty cache entry to count as a cache hit")
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected no messages, got %#v", got)
+	}
+}
+
+func TestLoadUnifiedInboxFromCacheUsesPrimaryAndLegacyKeys(t *testing.T) {
+	accounts := []config.Account{
+		{Name: "Primary Account", Email: "primary@example.com"},
+		{Name: "Legacy Account", Email: "legacy@example.com"},
+	}
+	mockConfig := newMockConfigManager(accounts)
+	cache := cachepkg.New(t.TempDir(), false, 10)
+	mw := &MainWindow{
+		cache:             cache,
+		config:            mockConfig,
+		accountController: controllers.NewAccountController(mockConfig, cache),
+		logger:            logging.NewComponent("ui-test"),
+	}
+
+	primaryData, err := json.Marshal([]email.Message{{UID: 1, Subject: "primary"}})
+	if err != nil {
+		t.Fatalf("marshal primary unified messages: %v", err)
+	}
+	legacyData, err := json.Marshal([]email.Message{{UID: 2, Subject: "legacy"}})
+	if err != nil {
+		t.Fatalf("marshal legacy unified messages: %v", err)
+	}
+
+	if err := cache.Set(fmt.Sprintf("%s:messages:INBOX", accountCacheKey("Primary Account")), primaryData, time.Hour); err != nil {
+		t.Fatalf("set primary unified cache entry: %v", err)
+	}
+	if err := cache.Set("Legacy Account:messages:INBOX", legacyData, time.Hour); err != nil {
+		t.Fatalf("set legacy unified cache entry: %v", err)
+	}
+
+	got, found := mw.loadUnifiedInboxFromCache()
+	if !found {
+		t.Fatalf("expected unified inbox cache to be found")
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 unified inbox messages, got %d", len(got))
+	}
+
+	seenSubjects := map[string]bool{}
+	for _, item := range got {
+		seenSubjects[item.Message.Subject] = true
+		if item.FolderName != "INBOX" {
+			t.Fatalf("expected folder name INBOX, got %q", item.FolderName)
+		}
+	}
+	if !seenSubjects["primary"] || !seenSubjects["legacy"] {
+		t.Fatalf("unexpected unified inbox messages: %#v", got)
+	}
+}
+
+func TestLoadUnifiedInboxFromCacheReportsEmptyCacheHit(t *testing.T) {
+	accounts := []config.Account{{Name: "Empty Unified", Email: "empty@example.com"}}
+	mockConfig := newMockConfigManager(accounts)
+	cache := cachepkg.New(t.TempDir(), false, 10)
+	mw := &MainWindow{
+		cache:             cache,
+		config:            mockConfig,
+		accountController: controllers.NewAccountController(mockConfig, cache),
+		logger:            logging.NewComponent("ui-test"),
+	}
+
+	data, err := json.Marshal([]email.Message{})
+	if err != nil {
+		t.Fatalf("marshal empty unified messages: %v", err)
+	}
+
+	if err := cache.Set(fmt.Sprintf("%s:messages:INBOX", accountCacheKey("Empty Unified")), data, time.Hour); err != nil {
+		t.Fatalf("set empty unified cache entry: %v", err)
+	}
+
+	got, found := mw.loadUnifiedInboxFromCache()
+	if !found {
+		t.Fatalf("expected empty unified cache entry to count as a cache hit")
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected no unified inbox messages, got %#v", got)
 	}
 }

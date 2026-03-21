@@ -128,6 +128,29 @@ func TestGetSetMessages(t *testing.T) {
 	}
 }
 
+func TestRefreshMessageListUsesCallbackWhenConfigured(t *testing.T) {
+	app := test.NewApp()
+	defer app.Quit()
+
+	window := test.NewWindow(nil)
+	defer window.Close()
+
+	statusBar := widget.NewLabel("Ready")
+	accountController := &mockAccountController{}
+
+	mlc := NewMessageListController(accountController, statusBar, window)
+	called := false
+	mlc.SetOnRefreshRequested(func() {
+		called = true
+	})
+
+	mlc.RefreshMessageList()
+
+	if !called {
+		t.Fatal("expected refresh callback to be invoked")
+	}
+}
+
 func TestSortMessages(t *testing.T) {
 	app := test.NewApp()
 	defer app.Quit()

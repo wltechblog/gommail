@@ -152,6 +152,7 @@ func (ac *AccountControllerImpl) CloseAllClients() {
 		if err := client.Disconnect(); err != nil {
 			ac.logger.Warn("Error disconnecting IMAP client for account %s: %v", accountName, err)
 		}
+		client.Stop()
 	}
 
 	// Clear the map
@@ -169,6 +170,7 @@ func (ac *AccountControllerImpl) CloseClientForAccount(accountName string) {
 		if err := client.Disconnect(); err != nil {
 			ac.logger.Warn("Error disconnecting IMAP client for account %s: %v", accountName, err)
 		}
+		client.Stop()
 		delete(ac.accountClients, accountName)
 	}
 }

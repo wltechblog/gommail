@@ -42,7 +42,8 @@ type MessageListControllerImpl struct {
 	window            fyne.Window
 
 	// Callbacks
-	onMessagesChanged func()
+	onMessagesChanged  func()
+	onRefreshRequested func()
 }
 
 // NewMessageListController creates a new MessageListController.
@@ -94,6 +95,11 @@ func (mlc *MessageListControllerImpl) SetOnMessagesChanged(callback func()) {
 	mlc.onMessagesChanged = callback
 }
 
+// SetOnRefreshRequested sets the callback used to repaint the visible message list widget.
+func (mlc *MessageListControllerImpl) SetOnRefreshRequested(callback func()) {
+	mlc.onRefreshRequested = callback
+}
+
 // GetMessages returns the current message list.
 func (mlc *MessageListControllerImpl) GetMessages() []email.MessageIndexItem {
 	return mlc.messages
@@ -109,6 +115,10 @@ func (mlc *MessageListControllerImpl) SetMessages(messages []email.MessageIndexI
 
 // RefreshMessageList refreshes the message list display.
 func (mlc *MessageListControllerImpl) RefreshMessageList() {
+	if mlc.onRefreshRequested != nil {
+		mlc.onRefreshRequested()
+		return
+	}
 	if mlc.messageList != nil {
 		mlc.messageList.Refresh()
 	}
