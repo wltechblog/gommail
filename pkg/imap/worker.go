@@ -2058,8 +2058,6 @@ func (w *IMAPWorker) checkForNewMessages(folder string) {
 	lastCount := w.lastMessageCount[folder]
 	lastUID := w.lastHighestUID[folder]
 	initialSyncDone := w.initialSyncDone[folder]
-	lastReconnectTime := w.lastReconnectTime
-	gracePeriod := w.reconnectGracePeriod
 
 	// Always advance the message-count watermark so we don't re-trigger on the
 	// same EXISTS count change. We deliberately defer updating lastHighestUID
@@ -2074,19 +2072,6 @@ func (w *IMAPWorker) checkForNewMessages(folder string) {
 
 	// Check for new messages (only after initial sync is complete)
 	if initialSyncDone && (currentMessageCount > lastCount || currentHighestUID > lastUID) {
-		// Check if we're in the grace period after reconnection
-		timeSinceReconnect := time.Since(lastReconnectTime)
-		inGracePeriod := !lastReconnectTime.IsZero() && timeSinceReconnect < gracePeriod
-
-		if inGracePeriod {
-			w.logger.Debug("Suppressing new message notifications for folder %s (in %v grace period after reconnection, %v elapsed)",
-				folder, gracePeriod, timeSinceReconnect)
-			// Advance UID watermark so we don't re-trigger after the grace period.
-			w.mu.Lock()
-			w.lastHighestUID[folder] = currentHighestUID
-			w.mu.Unlock()
-			return
-		}
 
 		// Detect potential tracking state reset (massive jump in message count from 0)
 		// This prevents notification floods when tracking state is lost
@@ -2421,6 +2406,13 @@ func (w *IMAPWorker) initiateReconnection() {
 
 // reconnectionLoop handles the reconnection attempts with exponential backoff
 func (w *IMAPWorker) reconnectionLoop() {
+	// Capture IDLE state now, before reconnection clears it, so we can
+	// restart monitoring and detect messages that arrived while offline.
+	w.mu.RLock()
+	wasIDLEActive := w.idleActive
+	savedIDLEFolder := w.idleFolder
+	w.mu.RUnlock()
+
 	for {
 		select {
 		case <-w.ctx.Done():
@@ -2454,13 +2446,10 @@ func (w *IMAPWorker) reconnectionLoop() {
 			w.logger.Debug("Successfully reconnected to IMAP server for account: %s", w.accountName)
 			w.setState(ConnectionStateConnected, nil)
 
-			// Reset reconnection attempt counter and set reconnection time
+			// Reset reconnection attempt counter
 			w.mu.Lock()
 			w.reconnectAttempt = 0
-			w.lastReconnectTime = time.Now()
 			w.mu.Unlock()
-
-			w.logger.Debug("Set reconnection grace period for account %s (duration: %v)", w.accountName, w.reconnectGracePeriod)
 
 			// Trigger reconnected callback
 			if w.onConnectionStateChange != nil {
@@ -2470,6 +2459,49 @@ func (w *IMAPWorker) reconnectionLoop() {
 					Attempt: currentAttempt,
 				}
 				go w.onConnectionStateChange(event)
+			}
+
+			// Determine which folder to monitor.
+			folderToMonitor := savedIDLEFolder
+			if folderToMonitor == "" {
+				folderToMonitor = "INBOX"
+			}
+			w.logger.Info("Restarting IDLE monitoring for folder %s after reconnection (was active before: %v)", folderToMonitor, wasIDLEActive)
+
+			// Restart IDLE via the command channel so it runs on the event loop,
+			// then immediately check for messages that arrived while disconnected.
+			startIDLECmd := NewStartIDLECommand(folderToMonitor)
+			startIDLECmd.ResponseCh = make(chan *IMAPResponse, 1)
+			idleCtx, idleCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			startIDLECmd.Context = idleCtx
+
+			select {
+			case w.commandCh <- startIDLECmd:
+				select {
+				case resp := <-startIDLECmd.ResponseCh:
+					idleCancel()
+					if resp.Success {
+						w.logger.Info("Successfully restarted IDLE monitoring for %s after reconnection", folderToMonitor)
+					} else {
+						w.logger.Error("Failed to restart IDLE for %s after reconnection: %v", folderToMonitor, resp.Error)
+					}
+					// Always check for new messages regardless of IDLE restart outcome –
+					// messages may have arrived while the connection was down.
+					w.logger.Info("Checking for messages that arrived while disconnected for folder: %s", folderToMonitor)
+					w.sendCheckNewMessagesCommand(folderToMonitor)
+				case <-idleCtx.Done():
+					idleCancel()
+					w.logger.Error("Timeout waiting for IDLE restart for %s after reconnection", folderToMonitor)
+					w.sendCheckNewMessagesCommand(folderToMonitor)
+				case <-w.ctx.Done():
+					idleCancel()
+				}
+			case <-w.ctx.Done():
+				idleCancel()
+			case <-time.After(5 * time.Second):
+				idleCancel()
+				w.logger.Error("Failed to queue IDLE start command for %s after reconnection (channel full)", folderToMonitor)
+				w.sendCheckNewMessagesCommand(folderToMonitor)
 			}
 
 			return
