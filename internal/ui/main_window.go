@@ -190,7 +190,14 @@ type MainWindow struct {
 	subjectHeaderBtn *widget.Button
 	toggleViewButton *ttwidget.Button
 
+	// backgroundWg tracks all fire-and-forget goroutines so cleanup can wait
+	// for them to finish before tearing down shared state.
+	backgroundWg sync.WaitGroup
+
 	// Message state - synchronized with controllers
+	// messagesMu protects messages and selectedMessage from concurrent access.
+	// All reads/writes must hold this lock (or be guaranteed to run on the UI thread via fyne.Do).
+	messagesMu      sync.RWMutex
 	messages        []email.MessageIndexItem
 	selectedMessage *email.MessageIndexItem
 
@@ -276,13 +283,12 @@ func newMessageListWithRightClick(mainWindow *MainWindow) *messageListWithRightC
 
 	// Handle message selection
 	list.OnSelected = func(id widget.ListItemID) {
-		fmt.Printf("DEBUG [OnSelected]: List widget selected ID=%d, messageCount=%d\n", id, len(mainWindow.messages))
+		mainWindow.logger.Debug("OnSelected: List widget selected ID=%d, messageCount=%d", id, len(mainWindow.messages))
 		if id >= 0 && id < len(mainWindow.messages) {
-			fmt.Printf("DEBUG [OnSelected]: Calling selectMessage(%d) for subject: %s\n", id, mainWindow.messages[id].Message.Subject)
+			mainWindow.logger.Debug("OnSelected: Calling selectMessage(%d) for subject: %s", id, mainWindow.messages[id].Message.Subject)
 			mainWindow.selectMessage(id)
 		} else {
-			fmt.Printf("DEBUG [OnSelected]: Invalid ID %d (messageCount=%d) - ignoring selection\n", id, len(mainWindow.messages))
-			mainWindow.logger.Warn("List widget selection with invalid ID %d (messageCount=%d)", id, len(mainWindow.messages))
+			mainWindow.logger.Warn("OnSelected: Invalid ID %d (messageCount=%d) - ignoring selection", id, len(mainWindow.messages))
 		}
 	}
 
@@ -302,19 +308,19 @@ func (m *messageListWithRightClick) CreateRenderer() fyne.WidgetRenderer {
 
 // TappedSecondary handles right-click events on the message list
 func (m *messageListWithRightClick) TappedSecondary(pe *fyne.PointEvent) {
-	fmt.Printf("DEBUG [messageListWithRightClick.TappedSecondary]: Right-click at position %v\n", pe.Position)
+	m.mainWindow.logger.Debug("TappedSecondary: Right-click at position %v", pe.Position)
 
 	// The right-click should act on the currently selected message
 	// We don't need to calculate which message was clicked because the user
 	// should first left-click to select, then right-click for context menu
 	if m.mainWindow.selectedMessage != nil {
-		fmt.Printf("DEBUG [messageListWithRightClick.TappedSecondary]: Showing context menu for selected message: %s\n", m.mainWindow.selectedMessage.Message.Subject)
+		m.mainWindow.logger.Debug("TappedSecondary: Showing context menu for selected message: %s", m.mainWindow.selectedMessage.Message.Subject)
 		// Convert the position to canvas coordinates and show context menu
 		canvasPos := fyne.CurrentApp().Driver().AbsolutePositionForObject(m)
 		canvasPos = canvasPos.Add(pe.Position)
 		m.mainWindow.showMessageContextMenuAtPosition(canvasPos)
 	} else {
-		fmt.Printf("DEBUG [messageListWithRightClick.TappedSecondary]: No message selected, cannot show context menu\n")
+		m.mainWindow.logger.Debug("TappedSecondary: No message selected, cannot show context menu")
 	}
 }
 
@@ -498,16 +504,15 @@ func (m *messageListItem) setSelected(selected bool) {
 
 // Tapped handles left-click events on the message item
 func (m *messageListItem) Tapped(pe *fyne.PointEvent) {
-	fmt.Printf("DEBUG [messageListItem.Tapped]: Left-click on message ID=%d\n", m.messageID)
+	m.mainWindow.logger.Debug("messageListItem.Tapped: Left-click on message ID=%d", m.messageID)
 
 	// Validate message ID bounds before selection
 	if m.messageID < 0 || m.messageID >= len(m.mainWindow.messages) {
-		fmt.Printf("DEBUG [messageListItem.Tapped]: Invalid message ID %d (messageCount=%d) - ignoring click\n", m.messageID, len(m.mainWindow.messages))
-		m.mainWindow.logger.Warn("Message list item click with invalid ID %d (messageCount=%d)", m.messageID, len(m.mainWindow.messages))
+		m.mainWindow.logger.Warn("messageListItem.Tapped: Invalid message ID %d (messageCount=%d) - ignoring click", m.messageID, len(m.mainWindow.messages))
 		return
 	}
 
-	fmt.Printf("DEBUG [messageListItem.Tapped]: Selecting message %d: %s\n", m.messageID, m.mainWindow.messages[m.messageID].Message.Subject)
+	m.mainWindow.logger.Debug("messageListItem.Tapped: Selecting message %d: %s", m.messageID, m.mainWindow.messages[m.messageID].Message.Subject)
 
 	// Simple single selection for left-click
 	// Multiple selection will be handled via right-click or keyboard shortcuts
@@ -639,7 +644,7 @@ func (m *messageListItem) updateContent(messageID int, message *email.MessageInd
 // createMessageListWithRightClick creates a message list with right-click support
 func (mw *MainWindow) createMessageListWithRightClick() fyne.CanvasObject {
 	// Create message list with custom items that handle right-clicks directly
-	fmt.Printf("DEBUG [createMessageListWithRightClick]: Creating message list with custom items\n")
+	mw.logger.Debug("createMessageListWithRightClick: Creating message list with custom items")
 	return newMessageListWithRightClick(mw)
 }
 
@@ -967,8 +972,11 @@ func (mw *MainWindow) setupUI() {
 		})
 
 		// When view is toggled, refresh the current message display
-		if mw.selectedMessage != nil {
-			go mw.fetchAndDisplayMessage(mw.selectedMessage)
+		mw.messagesMu.RLock()
+		msg := mw.selectedMessage
+		mw.messagesMu.RUnlock()
+		if msg != nil {
+			go mw.fetchAndDisplayMessage(msg)
 		}
 	})
 
@@ -1063,19 +1071,19 @@ func (mw *MainWindow) setupUI() {
 	// Use the same proportional sizing approach as the message list
 
 	// Create header buttons
-	fmt.Printf("DEBUG: Creating header buttons\n")
+	mw.logger.Debug("Creating header buttons")
 	mw.dateHeaderBtn = widget.NewButton("Date", func() {
-		fmt.Printf("DEBUG: Date header button clicked\n")
+		mw.logger.Debug("Date header button clicked")
 		mw.messageListController.SetSortBy(controllers.SortByDate)
 	})
 
 	mw.senderHeaderBtn = widget.NewButton("Sender", func() {
-		fmt.Printf("DEBUG: Sender header button clicked\n")
+		mw.logger.Debug("Sender header button clicked")
 		mw.messageListController.SetSortBy(controllers.SortBySender)
 	})
 
 	mw.subjectHeaderBtn = widget.NewButton("Subject", func() {
-		fmt.Printf("DEBUG: Subject header button clicked\n")
+		mw.logger.Debug("Subject header button clicked")
 		mw.messageListController.SetSortBy(controllers.SortBySubject)
 	})
 	mw.logger.Debug("Header buttons created successfully")
@@ -1103,12 +1111,9 @@ func (mw *MainWindow) setupUI() {
 	leftSide := container.NewHBox(dateHeaderContainer, senderHeaderContainer)
 	messageHeader := container.NewBorder(nil, nil, leftSide, nil, mw.subjectHeaderBtn)
 
-	// Create message list with right-click detection
-	messageListWithRightClick := mw.createMessageListWithRightClick()
-
 	messageListWithHeader := container.NewBorder(
 		messageHeader, nil, nil, nil,
-		messageListWithRightClick,
+		mw.messageListWithRightClick,
 	)
 
 	// Wrap message container in scroll container for vertical scrolling
@@ -1159,26 +1164,24 @@ func (mw *MainWindow) updateMessageViewToggleButton() {
 
 // setupMessageListContextMenu sets up the right-click context menu for the message list
 func (mw *MainWindow) setupMessageListContextMenu() {
-	fmt.Printf("DEBUG: Setting up message list context menu\n")
+	mw.logger.Debug("Setting up message list context menu")
 
 	// Add keyboard shortcuts as alternatives
 	canvas := mw.window.Canvas()
 
 	// Use Shift+F10 as context menu shortcut (standard Windows/Linux shortcut)
 	canvas.AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyF10, Modifier: fyne.KeyModifierShift}, func(shortcut fyne.Shortcut) {
-		fmt.Printf("DEBUG: Context menu shortcut (Shift+F10) triggered\n")
+		mw.logger.Debug("Context menu shortcut (Shift+F10) triggered")
 		mw.showMessageContextMenu()
 	})
 
 	// Also add Ctrl+M as an alternative context menu shortcut
 	canvas.AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyM, Modifier: fyne.KeyModifierControl}, func(shortcut fyne.Shortcut) {
-		fmt.Printf("DEBUG: Context menu shortcut (Ctrl+M) triggered\n")
+		mw.logger.Debug("Context menu shortcut (Ctrl+M) triggered")
 		mw.showMessageContextMenu()
 	})
 
-	// Context menu is available via keyboard shortcuts: Shift+F10 or Ctrl+M
-
-	fmt.Printf("DEBUG: Message list context menu setup complete\n")
+	mw.logger.Debug("Message list context menu setup complete")
 }
 
 // ============================================================================
@@ -1228,6 +1231,19 @@ func (mw *MainWindow) loadCachedDataAndAutoSelect() {
 // cleanup handles cleanup of resources when the window is closed
 // fastShutdown: if true, skips optional cleanup steps for faster application termination
 func (mw *MainWindow) cleanup(fastShutdown bool) {
+	// Wait for background goroutines to finish (with a timeout to avoid blocking forever)
+	done := make(chan struct{})
+	go func() {
+		mw.backgroundWg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		mw.logger.Debug("All background goroutines finished")
+	case <-time.After(5 * time.Second):
+		mw.logger.Warn("Timed out waiting for background goroutines to finish")
+	}
+
 	// Cancel any active read timer
 	mw.cancelReadTimer()
 
@@ -1422,8 +1438,10 @@ func (mw *MainWindow) toggleSortOrder() {
 func (mw *MainWindow) clearAccountState() {
 	// Clear current message list and folder selection when switching accounts
 	// This ensures the UI immediately reflects the account switch
+	mw.messagesMu.Lock()
 	mw.messages = []email.MessageIndexItem{}
 	mw.selectedMessage = nil
+	mw.messagesMu.Unlock()
 
 	// Clear folder list and current folder to prevent showing folders from previous account
 	mw.folderController.SetFolders([]email.Folder{})
@@ -1520,12 +1538,7 @@ func (mw *MainWindow) selectAccount(account *config.Account) {
 	if !needsConnect {
 		mw.logger.Info("Reusing existing connected IMAP client for account: %s", account.Name)
 		newClient.SetConnectionStateCallback(func(event email.ConnectionEvent) {
-			imapEvent := imap.ConnectionEvent{
-				State:   imap.ConnectionState(event.State),
-				Error:   event.Error,
-				Attempt: event.Attempt,
-			}
-			mw.handleConnectionStateChange(account.Name, imapEvent)
+			mw.handleConnectionStateChange(account.Name, event)
 		})
 
 		if cachedFoldersFound {
@@ -1545,13 +1558,7 @@ func (mw *MainWindow) selectAccount(account *config.Account) {
 
 		// Set up connection state callback before connecting
 		client.SetConnectionStateCallback(func(event email.ConnectionEvent) {
-			// Convert email.ConnectionEvent to imap.ConnectionEvent for compatibility with existing handler
-			imapEvent := imap.ConnectionEvent{
-				State:   imap.ConnectionState(event.State),
-				Error:   event.Error,
-				Attempt: event.Attempt,
-			}
-			mw.handleConnectionStateChange(selectedAccount.Name, imapEvent)
+			mw.handleConnectionStateChange(selectedAccount.Name, event)
 		})
 
 		// Now connect to server and refresh data in background
@@ -1784,7 +1791,11 @@ func (mw *MainWindow) loadUnifiedInboxMessages(forceRefresh bool) {
 
 	// Fetch fresh messages in background and wait for ALL accounts to complete
 	// before replacing the unified mailbox contents.
-	go mw.fetchFreshUnifiedInboxMessagesInBackground()
+	mw.backgroundWg.Add(1)
+	go func() {
+		defer mw.backgroundWg.Done()
+		mw.fetchFreshUnifiedInboxMessagesInBackground()
+	}()
 }
 
 // fetchFreshUnifiedInboxMessagesInBackground fetches fresh messages without blocking the UI
@@ -1906,7 +1917,10 @@ func (mw *MainWindow) fetchFreshUnifiedInboxMessagesInBackground() {
 			}
 
 			// Set all messages at once
+			mw.messagesMu.Lock()
 			mw.messages = allNewMessages
+			mw.selectedMessage = nil // previous pointer is now invalid
+			mw.messagesMu.Unlock()
 			mw.logger.Info("Set messages array to %d messages from all accounts", len(mw.messages))
 
 			// Apply user's sort preferences
@@ -2157,172 +2171,6 @@ func (mw *MainWindow) loadUnifiedInboxFromCache() ([]email.MessageIndexItem, boo
 	return allMessages, cacheFound
 }
 
-// fetchFreshUnifiedInboxMessages fetches fresh messages from all accounts
-func (mw *MainWindow) fetchFreshUnifiedInboxMessages() {
-	var allMessages []email.MessageIndexItem
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-
-	// Account clients are managed by AccountController
-	accounts := mw.config.GetAccounts()
-	mw.logger.Info("Fetching fresh messages from %d accounts for unified inbox", len(accounts))
-
-	// Load messages from each account's INBOX
-	for _, account := range accounts {
-		wg.Add(1)
-		go func(acc config.Account) {
-			defer wg.Done()
-
-			mw.logger.Debug("Fetching fresh INBOX messages for account: %s", acc.Name)
-
-			// Create or get IMAP client for this account
-			client, err := mw.getOrCreateIMAPClient(&acc)
-			if err != nil {
-				mw.logger.Error("Failed to create IMAP client for account %s: %v", acc.Name, err)
-				// Continue with other accounts even if this one fails
-				return
-			}
-
-			// Fetch fresh messages from INBOX (no limit - should be fast with cache)
-			messages, err := client.FetchFreshMessages("INBOX", 0)
-			if err != nil {
-				mw.logger.Error("Failed to fetch fresh INBOX messages for account %s: %v", acc.Name, err)
-				return
-			}
-
-			// Create SMTP client for this account
-			smtpClient := smtp.NewClient(email.ServerConfig{
-				Host:     acc.SMTP.Host,
-				Port:     acc.SMTP.Port,
-				Username: acc.SMTP.Username,
-				Password: acc.SMTP.Password,
-				TLS:      acc.SMTP.TLS,
-			})
-
-			// Convert to MessageIndexItem
-			mu.Lock()
-			for _, msg := range messages {
-				indexItem := email.MessageIndexItem{
-					Message:      msg,
-					AccountName:  acc.Name,
-					AccountEmail: acc.Email,
-					FolderName:   "INBOX",
-					IMAPClient:   client,
-					SMTPClient:   smtpClient,
-					AccountConfig: &email.AccountConfig{
-						Name:        acc.Name,
-						Email:       acc.Email,
-						DisplayName: acc.DisplayName,
-						IMAP: email.ServerConfig{
-							Host:     acc.IMAP.Host,
-							Port:     acc.IMAP.Port,
-							Username: acc.IMAP.Username,
-							Password: acc.IMAP.Password,
-							TLS:      acc.IMAP.TLS,
-						},
-						SMTP: email.ServerConfig{
-							Host:     acc.SMTP.Host,
-							Port:     acc.SMTP.Port,
-							Username: acc.SMTP.Username,
-							Password: acc.SMTP.Password,
-							TLS:      acc.SMTP.TLS,
-						},
-					},
-				}
-				allMessages = append(allMessages, indexItem)
-			}
-			mu.Unlock()
-
-			mw.logger.Debug("Fetched %d fresh messages from account %s INBOX", len(messages), acc.Name)
-		}(account)
-	}
-
-	// Wait for all accounts to finish loading
-	wg.Wait()
-
-	// Don't sort here - let the UI apply user's sort preferences
-	mw.logger.Info("Fetched total of %d fresh messages from unified inbox", len(allMessages))
-
-	// Cache the messages
-	mw.cacheUnifiedInboxMessages(allMessages)
-
-	// Update UI with proper synchronization
-	fyne.Do(func() {
-		// Store current selection info before updating messages
-		var selectedUID uint32
-		var selectedAccountName string
-		if mw.selectedMessage != nil {
-			selectedUID = mw.selectedMessage.Message.UID
-			selectedAccountName = mw.selectedMessage.AccountName
-		}
-
-		// Update messages array
-		mw.messages = allMessages
-
-		// Apply user's sort preferences to fresh messages
-		mw.sortMessages()
-
-		// Validate message array consistency after update
-		if !mw.validateMessageArrayConsistency() {
-			mw.logger.Error("Message array consistency check failed after unified inbox refresh")
-		}
-
-		// Force the list to update by clearing selection and refreshing
-		mw.messageList.UnselectAll()
-		mw.refreshMessageList()
-		mw.statusBar.SetText(fmt.Sprintf("Loaded %d messages from unified inbox", len(allMessages)))
-
-		// Try to restore selection if we had one
-		if selectedUID > 0 && selectedAccountName != "" {
-			for i, msg := range mw.messages {
-				if msg.Message.UID == selectedUID && msg.AccountName == selectedAccountName {
-					mw.logger.Debug("Restoring selection to message at index %d (UID=%d, Account=%s)", i, selectedUID, selectedAccountName)
-					mw.messageList.Select(i)
-					mw.selectMessage(i)
-					break
-				}
-			}
-		} else if len(mw.messages) > 0 && !mw.autoSelectionDone {
-			// Auto-select first message if no previous selection and auto-selection not done
-			mw.logger.Debug("Auto-selecting first message after fresh load")
-			mw.messageList.Select(0)
-			mw.selectMessage(0)
-			mw.autoSelectionDone = true
-		}
-
-		// Mark initial sync complete for all account INBOX folders to enable notifications
-		mw.accountController.ForEachClient(func(accountName string, client *imap.ClientWrapper) {
-			client.MarkInitialSyncComplete("INBOX")
-		})
-
-		// Start monitoring for all accounts in unified inbox
-		mw.startUnifiedInboxMonitoring()
-	})
-}
-
-// cacheUnifiedInboxMessages caches unified inbox messages for faster loading
-func (mw *MainWindow) cacheUnifiedInboxMessages(messages []email.MessageIndexItem) {
-	// Group messages by account for individual caching
-	accountMessages := make(map[string][]email.Message)
-
-	for _, indexItem := range messages {
-		accountMessages[indexItem.AccountName] = append(accountMessages[indexItem.AccountName], indexItem.Message)
-	}
-
-	// Cache messages for each account separately
-	for accountName, msgs := range accountMessages {
-		cacheKey := fmt.Sprintf("account_%s:messages:INBOX", accountName)
-		if data, err := json.Marshal(msgs); err == nil {
-			// Cache for 24 hours
-			if err := mw.cache.Set(cacheKey, data, 24*time.Hour); err != nil {
-				mw.logger.Warn("Failed to cache messages for account %s: %v", accountName, err)
-			} else {
-				mw.logger.Debug("Cached %d messages for account %s", len(msgs), accountName)
-			}
-		}
-	}
-}
-
 // cacheAccountMessages caches messages for a specific account
 func (mw *MainWindow) cacheAccountMessages(accountName string, messages []email.Message) {
 	cacheKey := fmt.Sprintf("account_%s:messages:INBOX", accountName)
@@ -2336,72 +2184,48 @@ func (mw *MainWindow) cacheAccountMessages(accountName string, messages []email.
 	}
 }
 
-// getOrCreateIMAPClient gets or creates an IMAP client for the specified account
+// getOrCreateIMAPClient gets or creates an IMAP client for the specified account.
+// The check-and-create is routed through AccountController.GetOrCreateIMAPClientWithFactory
+// to ensure atomicity (no duplicate clients for the same account).
 func (mw *MainWindow) getOrCreateIMAPClient(account *config.Account) (*imap.ClientWrapper, error) {
-	// Check if we already have a connected client for this account
-	if client, exists := mw.accountController.GetIMAPClientForAccount(account.Name); exists && client != nil {
-		// Verify the client is still connected
-		if client.IsConnected() {
-			// Client is connected and ready to use
-			return client, nil
-		} else {
-			// Client exists but is disconnected, remove it and create a new one
-			mw.logger.Debug("Existing IMAP client for account %s is disconnected, creating new one", account.Name)
-			mw.accountController.CloseClientForAccount(account.Name)
+	return mw.accountController.GetOrCreateIMAPClientWithFactory(account, func(acc *config.Account) (*imap.ClientWrapper, error) {
+		mw.logger.Debug("Creating new IMAP client for account: %s (%s:%d)", acc.Name, acc.IMAP.Host, acc.IMAP.Port)
+
+		serverConfig := email.ServerConfig{
+			Host:     acc.IMAP.Host,
+			Port:     acc.IMAP.Port,
+			Username: acc.IMAP.Username,
+			Password: acc.IMAP.Password,
+			TLS:      acc.IMAP.TLS,
 		}
-	}
 
-	mw.logger.Debug("Creating new IMAP client for account: %s (%s:%d)", account.Name, account.IMAP.Host, account.IMAP.Port)
-
-	// Convert config.ServerConfig to email.ServerConfig
-	serverConfig := email.ServerConfig{
-		Host:     account.IMAP.Host,
-		Port:     account.IMAP.Port,
-		Username: account.IMAP.Username,
-		Password: account.IMAP.Password,
-		TLS:      account.IMAP.TLS,
-	}
-
-	// Get tracing configuration and create tracer if enabled
-	var tracer io.Writer
-	tracingConfig := mw.config.GetTracing()
-	if tracingConfig.IMAP.Enabled {
-		imapTracer := trace.NewIMAPTracer(true, tracingConfig.IMAP.Directory)
-		tracer = imapTracer.GetAccountTracer(account.Name)
-	}
-
-	// Create new worker-based IMAP client with cache and tracing
-	client := imap.NewClientWrapperWithCacheAndTracer(serverConfig, mw.cache, accountCacheKey(account.Name), tracer)
-
-	// Start the worker
-	if err := client.Start(); err != nil {
-		mw.logger.Error("Failed to start IMAP worker for account %s: %v", account.Name, err)
-		return nil, fmt.Errorf("failed to start IMAP worker for %s: %w", account.Name, err)
-	}
-
-	// Set up connection state callback
-	client.SetConnectionStateCallback(func(event email.ConnectionEvent) {
-		// Convert email.ConnectionEvent to imap.ConnectionEvent for compatibility with existing handler
-		imapEvent := imap.ConnectionEvent{
-			State:   imap.ConnectionState(event.State),
-			Error:   event.Error,
-			Attempt: event.Attempt,
+		// Get tracing configuration and create tracer if enabled
+		var tracer io.Writer
+		tracingConfig := mw.config.GetTracing()
+		if tracingConfig.IMAP.Enabled {
+			imapTracer := trace.NewIMAPTracer(true, tracingConfig.IMAP.Directory)
+			tracer = imapTracer.GetAccountTracer(acc.Name)
 		}
-		mw.handleConnectionStateChange(account.Name, imapEvent)
+
+		client := imap.NewClientWrapperWithCacheAndTracer(serverConfig, mw.cache, accountCacheKey(acc.Name), tracer)
+
+		if err := client.Start(); err != nil {
+			return nil, fmt.Errorf("failed to start IMAP worker for %s: %w", acc.Name, err)
+		}
+
+		// Set up connection state callback (types are aliases, no conversion needed)
+		client.SetConnectionStateCallback(func(event email.ConnectionEvent) {
+			mw.handleConnectionStateChange(acc.Name, event)
+		})
+
+		if err := client.Connect(); err != nil {
+			client.Stop()
+			return nil, fmt.Errorf("failed to connect to IMAP server for %s: %w", acc.Name, err)
+		}
+
+		mw.logger.Debug("Successfully connected IMAP client for account: %s", acc.Name)
+		return client, nil
 	})
-
-	// Connect to the server
-	if err := client.Connect(); err != nil {
-		mw.logger.Error("Failed to connect IMAP client for account %s: %v", account.Name, err)
-		return nil, fmt.Errorf("failed to connect to IMAP server for %s: %w", account.Name, err)
-	}
-
-	mw.logger.Debug("Successfully connected IMAP client for account: %s", account.Name)
-
-	// Store the client
-	mw.accountController.StoreIMAPClient(account.Name, client)
-
-	return client, nil
 }
 
 // handleConnectionStateChange handles IMAP connection state changes
@@ -2850,8 +2674,10 @@ func (mw *MainWindow) selectMessage(id widget.ListItemID) {
 	}
 
 	msg := &mw.messages[id]
+	mw.messagesMu.Lock()
 	mw.selectedMessage = msg
-	fmt.Printf("DEBUG [selectMessage]: Selected message at index %d: %s (UID=%d, Account=%s)\n", id, msg.Message.Subject, msg.Message.UID, msg.AccountName)
+	mw.messagesMu.Unlock()
+	mw.logger.Debug("selectMessage: Selected message at index %d: %s (UID=%d, Account=%s)", id, msg.Message.Subject, msg.Message.UID, msg.AccountName)
 
 	// Refresh the message list to update selection highlighting (if available)
 	// Force immediate UI update by ensuring this runs on the UI thread
@@ -3272,7 +3098,7 @@ func (mw *MainWindow) showMoveToFolderDialogMultiple() {
 
 		dialog.ShowCustomConfirm("Move Messages", "Move", "Cancel", content, func(confirmed bool) {
 			if confirmed && folderSelect.Selected != "" {
-				fmt.Printf("DEBUG: Moving %d messages to folder: %s\n", len(selectedMessages), folderSelect.Selected)
+				mw.logger.Debug("Moving %d messages to folder: %s", len(selectedMessages), folderSelect.Selected)
 				mw.moveToFolderMultiple(selectedMessages, folderSelect.Selected)
 			}
 		}, mw.window)
@@ -4170,7 +3996,8 @@ func (mw *MainWindow) getAccountByName(accountName string) *config.Account {
 
 func (mw *MainWindow) composeMessage() {
 	if mw.accountController.GetCurrentAccount() == nil {
-		dialog.ShowInformation("No Account", "Please select an account first", mw.window)
+		// In unified inbox mode — let the user pick which account/persona to send from
+		mw.showAccountSelectionForCompose()
 		return
 	}
 
@@ -4198,6 +4025,110 @@ func (mw *MainWindow) composeMessage() {
 
 	composeWindow := NewComposeWindow(mw.app, mw.configManagerToConfig(), opts)
 	composeWindow.Show()
+}
+
+// showAccountSelectionForCompose shows a dialog for selecting a sending account/persona
+// when composing a new message from the unified inbox view.
+func (mw *MainWindow) showAccountSelectionForCompose() {
+	accounts := mw.config.GetAccounts()
+	if len(accounts) == 0 {
+		dialog.ShowInformation("No Accounts", "No email accounts are configured.", mw.window)
+		return
+	}
+
+	type accountEntry struct {
+		accountIndex     int
+		personalityEmail string // empty = main account identity
+		label            string
+	}
+
+	entries := make([]accountEntry, 0)
+	for i, acc := range accounts {
+		// Main account identity
+		entries = append(entries, accountEntry{
+			accountIndex:     i,
+			personalityEmail: "",
+			label:            fmt.Sprintf("%s (%s)", acc.Name, acc.Email),
+		})
+		// Personas
+		for _, p := range acc.Personalities {
+			entries = append(entries, accountEntry{
+				accountIndex:     i,
+				personalityEmail: p.Email,
+				label:            fmt.Sprintf("%s — %s (%s)", acc.Name, p.DisplayName, p.Email),
+			})
+		}
+	}
+
+	options := make([]string, len(entries))
+	for i, e := range entries {
+		options[i] = e.label
+	}
+
+	sel := widget.NewSelect(options, nil)
+	if len(options) > 0 {
+		sel.SetSelected(options[0])
+	}
+
+	content := container.NewVBox(
+		widget.NewLabel("Select the account or persona to send from:"),
+		sel,
+	)
+
+	dialog.ShowCustomConfirm("Select Sending Account", "Compose", "Cancel", content, func(confirmed bool) {
+		if !confirmed || sel.Selected == "" {
+			return
+		}
+
+		// Find the selected entry
+		var selectedEntry *accountEntry
+		for i, option := range options {
+			if option == sel.Selected {
+				e := entries[i]
+				selectedEntry = &e
+				break
+			}
+		}
+		if selectedEntry == nil {
+			return
+		}
+
+		allAccounts := mw.config.GetAccounts()
+		account := &allAccounts[selectedEntry.accountIndex]
+
+		smtpClient := smtp.NewClient(email.ServerConfig{
+			Host:     account.SMTP.Host,
+			Port:     account.SMTP.Port,
+			Username: account.SMTP.Username,
+			Password: account.SMTP.Password,
+			TLS:      account.SMTP.TLS,
+		})
+
+		opts := ComposeOptions{
+			Account:        account,
+			SMTPClient:     smtpClient,
+			AddressbookMgr: mw.addressbookMgr,
+			SelectedFrom:   selectedEntry.personalityEmail,
+			OnSent: func() {
+				if account.SentFolder != "" {
+					mw.refreshMessagesDebounced(account.SentFolder, func(err error) {
+						if err != nil {
+							mw.logger.Error("Failed to refresh sent folder after sending: %v", err)
+						}
+					})
+				}
+				fyne.Do(func() {
+					mw.statusBar.SetText("Message sent successfully")
+				})
+			},
+			OnClosed: func() {
+				mw.statusBar.SetText("Compose window closed")
+			},
+		}
+
+		composeWindow := NewComposeWindow(mw.app, mw.configManagerToConfig(), opts)
+		composeWindow.Show()
+	}, mw.window)
 }
 
 func (mw *MainWindow) replyToMessage() {
@@ -4473,7 +4404,9 @@ func (mw *MainWindow) moveToTrash() {
 	}
 
 	// Capture the selected message to avoid race conditions in the goroutine
+	mw.messagesMu.RLock()
 	selectedMessage := mw.selectedMessage
+	mw.messagesMu.RUnlock()
 	if selectedMessage == nil {
 		mw.statusBar.SetText("No message selected")
 		return
@@ -4620,7 +4553,9 @@ func (mw *MainWindow) moveToTrash() {
 
 func (mw *MainWindow) performDelete() {
 	// Capture the selected message to avoid race conditions in the goroutine
+	mw.messagesMu.RLock()
 	selectedMessage := mw.selectedMessage
+	mw.messagesMu.RUnlock()
 	if selectedMessage == nil {
 		mw.statusBar.SetText("No message selected")
 		return
@@ -4741,19 +4676,19 @@ func (mw *MainWindow) showMessageContextMenu() {
 		return
 	}
 
-	fmt.Printf("DEBUG: Creating context menu for message: %s\n", mw.selectedMessage.Message.Subject)
+	mw.logger.Debug("Creating context menu for message: %s", mw.selectedMessage.Message.Subject)
 
 	// Show the context menu at a reasonable position
 	canvasSize := mw.window.Canvas().Size()
 	menuPos := fyne.NewPos(canvasSize.Width/2-100, canvasSize.Height/2-100)
 
-	fmt.Printf("DEBUG: Showing context menu at position: %v\n", menuPos)
+	mw.logger.Debug("Showing context menu at position: %v", menuPos)
 	mw.showCustomContextMenuAtPosition(menuPos)
 }
 
 // handleRightClickAtPosition handles right-click at a specific position
 func (mw *MainWindow) handleRightClickAtPosition(pos fyne.Position) {
-	fmt.Printf("DEBUG: Handling right-click at position: %v\n", pos)
+	mw.logger.Debug("Handling right-click at position: %v", pos)
 	// For now, we'll show the context menu for the currently selected message
 	// In a more advanced implementation, we could calculate which message was clicked
 	// based on the position and the list item height
@@ -4800,37 +4735,31 @@ func (mw *MainWindow) showCustomContextMenuAtPosition(pos fyne.Position) {
 // createSingleMessageContextMenu creates context menu for single message selection
 func (mw *MainWindow) createSingleMessageContextMenu() *fyne.Container {
 	replyButton := mw.createContextMenuButton("Reply", func() {
-		fmt.Printf("DEBUG: Reply selected\n")
 		mw.currentContextPopup.Hide()
 		mw.replyToMessage()
 	})
 
 	replyAllButton := mw.createContextMenuButton("Reply All", func() {
-		fmt.Printf("DEBUG: Reply All selected\n")
 		mw.currentContextPopup.Hide()
 		mw.replyAllToMessage()
 	})
 
 	forwardButton := mw.createContextMenuButton("Forward", func() {
-		fmt.Printf("DEBUG: Forward selected\n")
 		mw.currentContextPopup.Hide()
 		mw.forwardMessage()
 	})
 
 	viewHeadersButton := mw.createContextMenuButton("View Headers", func() {
-		fmt.Printf("DEBUG: View Headers selected\n")
 		mw.currentContextPopup.Hide()
 		mw.showMessageHeaders()
 	})
 
 	moveToFolderButton := mw.createContextMenuButton("Move to Folder...", func() {
-		fmt.Printf("DEBUG: Move to Folder selected - showing folder dialog\n")
 		mw.currentContextPopup.Hide()
 		mw.showMoveToFolderDialog()
 	})
 
 	deleteButton := mw.createContextMenuButton("Delete", func() {
-		fmt.Printf("DEBUG: Delete selected\n")
 		mw.currentContextPopup.Hide()
 		mw.moveToTrash()
 	})
@@ -4855,19 +4784,16 @@ func (mw *MainWindow) createMultipleMessagesContextMenu(count int) *fyne.Contain
 	headerLabel.TextStyle = fyne.TextStyle{Bold: true}
 
 	moveToFolderButton := mw.createContextMenuButton("Move to Folder...", func() {
-		fmt.Printf("DEBUG: Move %d messages to Folder selected\n", count)
 		mw.currentContextPopup.Hide()
 		mw.showMoveToFolderDialogMultiple()
 	})
 
 	deleteButton := mw.createContextMenuButton(fmt.Sprintf("Delete %d Messages", count), func() {
-		fmt.Printf("DEBUG: Delete %d messages selected\n", count)
 		mw.currentContextPopup.Hide()
 		mw.moveToTrashMultiple()
 	})
 
 	clearSelectionButton := mw.createContextMenuButton("Clear Selection", func() {
-		fmt.Printf("DEBUG: Clear selection\n")
 		mw.currentContextPopup.Hide()
 		mw.clearSelection()
 	})
@@ -4974,7 +4900,7 @@ func (mw *MainWindow) showMoveToFolderDialog() {
 			// Create selection dialog
 			folderSelect := widget.NewSelect(folderNames, func(selected string) {
 				if selected != "" {
-					fmt.Printf("DEBUG: Moving message to folder: %s\n", selected)
+					mw.logger.Debug("Moving message to folder: %s", selected)
 					mw.moveToFolder(selected)
 				}
 			})
@@ -4987,7 +4913,7 @@ func (mw *MainWindow) showMoveToFolderDialog() {
 
 			dialog.ShowCustomConfirm("Move Message", "Move", "Cancel", content, func(confirmed bool) {
 				if confirmed && folderSelect.Selected != "" {
-					fmt.Printf("DEBUG: Moving message to folder: %s\n", folderSelect.Selected)
+					mw.logger.Debug("Moving message to folder: %s", folderSelect.Selected)
 					mw.moveToFolder(folderSelect.Selected)
 				}
 			}, mw.window)
@@ -4997,7 +4923,11 @@ func (mw *MainWindow) showMoveToFolderDialog() {
 
 // showMessageHeaders displays a window with the message headers in plain text
 func (mw *MainWindow) showMessageHeaders() {
-	if mw.selectedMessage == nil {
+	mw.messagesMu.RLock()
+	selMsg := mw.selectedMessage
+	mw.messagesMu.RUnlock()
+
+	if selMsg == nil {
 		dialog.ShowInformation("No Message", "Please select a message first", mw.window)
 		return
 	}
@@ -5023,7 +4953,7 @@ func (mw *MainWindow) showMessageHeaders() {
 			// Get the account-specific IMAP client
 			accounts := mw.config.GetAccounts()
 			for _, acc := range accounts {
-				if acc.Name == mw.selectedMessage.AccountName {
+				if acc.Name == selMsg.AccountName {
 					// Get the IMAP client for this specific account
 					if accountClient, exists := mw.accountController.GetIMAPClientForAccount(acc.Name); exists {
 						imapClient = accountClient
@@ -5039,16 +4969,16 @@ func (mw *MainWindow) showMessageHeaders() {
 		// Try to fetch the full message from the server to get all headers
 		if imapClient != nil {
 			mw.logger.Debug("Fetching full message for headers: account=%s, folder=%s, UID=%d",
-				mw.selectedMessage.AccountName, mw.selectedMessage.FolderName, mw.selectedMessage.Message.UID)
+				selMsg.AccountName, selMsg.FolderName, selMsg.Message.UID)
 
-			fullMessage, err = imapClient.FetchMessageWithFullHeaders(mw.selectedMessage.FolderName, mw.selectedMessage.Message.UID)
+			fullMessage, err = imapClient.FetchMessageWithFullHeaders(selMsg.FolderName, selMsg.Message.UID)
 			if err == nil && fullMessage != nil {
 				mw.logger.Debug("Successfully fetched message with %d headers", len(fullMessage.Headers))
 			}
 		} else {
 			// Fallback to using the cached message data
-			mw.logger.Debug("No IMAP client available for account %s, using cached message data", mw.selectedMessage.AccountName)
-			fullMessage = &mw.selectedMessage.Message
+			mw.logger.Debug("No IMAP client available for account %s, using cached message data", selMsg.AccountName)
+			fullMessage = &selMsg.Message
 		}
 
 		// Update UI on main thread
@@ -5230,19 +5160,27 @@ func (mw *MainWindow) moveToFolder(targetFolder string) {
 func (mw *MainWindow) performMoveToFolder(targetFolder string) {
 	mw.statusBar.SetText(fmt.Sprintf("Moving message to folder '%s'...", targetFolder))
 
+	// Capture selectedMessage before spawning goroutine to avoid data race
+	mw.messagesMu.RLock()
+	msg := mw.selectedMessage
+	mw.messagesMu.RUnlock()
+	if msg == nil {
+		return
+	}
+
 	go func() {
 		// Use the MessageIndexItem's MoveTo method - much simpler!
-		err := mw.selectedMessage.MoveTo(targetFolder)
+		err := msg.MoveTo(targetFolder)
 		if err != nil {
 			fyne.Do(func() {
 				mw.statusBar.SetText(fmt.Sprintf("Failed to move message: %v", err))
 				dialog.ShowError(fmt.Errorf("Failed to move message: %v", err), mw.window)
 			})
-			mw.logger.Error("Failed to move message %d to folder %s: %v", mw.selectedMessage.Message.UID, targetFolder, err)
+			mw.logger.Error("Failed to move message %d to folder %s: %v", msg.Message.UID, targetFolder, err)
 			return
 		}
 
-		mw.logger.Info("Successfully moved message %d to folder %s", mw.selectedMessage.Message.UID, targetFolder)
+		mw.logger.Info("Successfully moved message %d to folder %s", msg.Message.UID, targetFolder)
 
 		// Clear the selected message since it's no longer in the current folder
 		fyne.Do(func() {
@@ -5332,7 +5270,11 @@ func (mw *MainWindow) refreshAll() {
 		})
 		// Invalidate cache to ensure fresh data is loaded
 		mw.invalidateUnifiedInboxCache()
-		go mw.fetchFreshUnifiedInboxMessages()
+		mw.backgroundWg.Add(1)
+		go func() {
+			defer mw.backgroundWg.Done()
+			mw.fetchFreshUnifiedInboxMessagesInBackground()
+		}()
 		return
 	}
 
@@ -5465,8 +5407,10 @@ func (mw *MainWindow) clearInMemoryData() {
 	mw.logger.Debug("Clearing in-memory data structures")
 
 	// Clear message data
+	mw.messagesMu.Lock()
 	mw.messages = []email.MessageIndexItem{}
 	mw.selectedMessage = nil
+	mw.messagesMu.Unlock()
 
 	// Clear folder data
 	mw.folderController.SetFolders([]email.Folder{})
@@ -6657,8 +6601,10 @@ func (mw *MainWindow) handleDeletedFolder(deletedFolder string) {
 		mw.logger.Info("Currently selected folder %s was deleted, selecting alternative", deletedFolder)
 
 		// Clear current selection
+		mw.messagesMu.Lock()
 		mw.messages = []email.MessageIndexItem{}
 		mw.selectedMessage = nil
+		mw.messagesMu.Unlock()
 
 		// Update UI
 		fyne.Do(func() {
@@ -6868,7 +6814,11 @@ func (mw *MainWindow) startUnifiedInboxMonitoring() {
 					})
 
 					// Fetch fresh messages from just this account and merge them
-					go mw.refreshSingleAccountInUnifiedInbox(capturedAccountName)
+					mw.backgroundWg.Add(1)
+					go func() {
+						defer mw.backgroundWg.Done()
+						mw.refreshSingleAccountInUnifiedInbox(capturedAccountName)
+					}()
 				} else {
 					mw.logger.Debug("Skipping unified inbox refresh due to delete operation in progress (account: %s, folder: %s)", capturedAccountName, updatedFolder)
 				}
@@ -7042,7 +6992,10 @@ func (mw *MainWindow) endCurrentAccountReconnect() {
 	mw.reconnectInProgress = false
 }
 
-// performHealthChecks checks the health of all account connections
+// performHealthChecks checks the health of all account connections.
+// This is observation-only: the worker owns reconnection via its own health
+// ticker and attemptAutomaticReconnection. The UI monitor only updates the
+// status bar to keep the user informed.
 func (mw *MainWindow) performHealthChecks() {
 	unhealthyAccounts := 0
 	totalAccounts := 0
@@ -7052,18 +7005,12 @@ func (mw *MainWindow) performHealthChecks() {
 		mw.accountController.ForEachClient(func(accountName string, client *imap.ClientWrapper) {
 			totalAccounts++
 
-			// Check if connection is healthy
+			// Check if connection is healthy (observation only)
 			isHealthy := mw.isClientConnectionHealthy(client, accountName)
 
 			if !isHealthy {
 				unhealthyAccounts++
-				mw.logger.Warn("Health check failed for account %s, connection may be dead", accountName)
-
-				// If the connection is unhealthy and monitoring is active, restart monitoring
-				if client.IsMonitoring() {
-					mw.logger.Info("Restarting monitoring for unhealthy account %s", accountName)
-					go mw.restartAccountMonitoring(accountName, client)
-				}
+				mw.logger.Warn("Health check: account %s connection unhealthy (worker will handle reconnection)", accountName)
 			}
 		})
 	} else {
@@ -7078,22 +7025,21 @@ func (mw *MainWindow) performHealthChecks() {
 			totalAccounts = 1
 			accountName := mw.accountController.GetCurrentAccount().Name
 
-			// Check if connection is healthy
+			// Check if connection is healthy (observation only)
 			isHealthy := mw.isClientConnectionHealthy(mw.imapClient, accountName)
 
 			if !isHealthy {
 				unhealthyAccounts++
-				mw.logger.Warn("Health check failed for current account %s, connection may be dead", accountName)
-
-				// Attempt to reconnect the current account
-				mw.logger.Info("Attempting to reconnect current account %s", accountName)
-				go mw.reconnectCurrentAccount()
+				mw.logger.Warn("Health check: current account %s connection unhealthy (worker will handle reconnection)", accountName)
 			}
 		}
 	}
 
 	if unhealthyAccounts > 0 {
 		mw.logger.Warn("Health check completed: %d/%d accounts have unhealthy connections", unhealthyAccounts, totalAccounts)
+		fyne.Do(func() {
+			mw.statusBar.SetText(fmt.Sprintf("Connection issues detected on %d account(s) — reconnecting...", unhealthyAccounts))
+		})
 	} else if totalAccounts > 0 {
 		mw.logger.Debug("Health check completed: all %d accounts have healthy connections", totalAccounts)
 	}

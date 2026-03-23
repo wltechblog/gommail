@@ -89,6 +89,29 @@ type IMAPWorker struct {
 	logger *logging.Logger
 }
 
+// Worker configuration defaults
+const (
+	// DefaultCommandChBuffer is the buffer size for the command channel.
+	DefaultCommandChBuffer = 100
+	// DefaultIDLETimeout is the IDLE timeout (RFC 2177 recommends < 30 min).
+	DefaultIDLETimeout = 29 * time.Minute
+	// DefaultReconnectGracePeriod is how long to wait after reconnection before
+	// considering the connection unhealthy again.
+	DefaultReconnectGracePeriod = 30 * time.Second
+	// DefaultHealthCheckInterval is the interval between health check ticks.
+	DefaultHealthCheckInterval = 30 * time.Second
+	// DefaultReconnectDelay is the initial delay before a reconnection attempt.
+	DefaultReconnectDelay = 1 * time.Second
+	// MaxReconnectDelay caps the exponential back-off for reconnection.
+	MaxReconnectDelay = 30 * time.Second
+	// DefaultMaxReconnectAttempts is kept for compatibility but not enforced.
+	DefaultMaxReconnectAttempts = 10
+	// MaxNewMessageNotifications caps the number of notifications per check.
+	MaxNewMessageNotifications = 10
+	// ReconnectionTimeout is the per-attempt timeout for automatic reconnection.
+	ReconnectionTimeout = 30 * time.Second
+)
+
 // NewIMAPWorker creates a new IMAP worker for the specified account
 func NewIMAPWorker(config *email.ServerConfig, accountName, cacheKey string, cache *cache.Cache) *IMAPWorker {
 	worker := &IMAPWorker{
@@ -96,19 +119,19 @@ func NewIMAPWorker(config *email.ServerConfig, accountName, cacheKey string, cac
 		accountName: accountName,
 		cacheKey:    cacheKey,
 		cache:       cache,
-		commandCh:   make(chan *IMAPCommand, 100), // Buffered channel for commands
-		idleUpdateCh: make(chan struct{}, 1),       // Buffered: avoids blocking the unilateral data handler
+		commandCh:   make(chan *IMAPCommand, DefaultCommandChBuffer),
+		idleUpdateCh: make(chan struct{}, 1),
 		// stopCh and ctx will be created in Start()
 		state:                ConnectionStateDisconnected,
-		idleTimeout:          29 * time.Minute, // Default 29 minutes (RFC recommends < 30 min)
+		idleTimeout:          DefaultIDLETimeout,
 		lastMessageCount:     make(map[string]uint32),
 		lastHighestUID:       make(map[string]uint32),
 		initialSyncDone:      make(map[string]bool),
-		reconnectGracePeriod: 30 * time.Second, // Grace period after reconnection
-		healthCheckInterval:  30 * time.Second, // Default 30 seconds
-		reconnectDelay:       1 * time.Second,  // Start with 1 second
-		maxReconnectDelay:    30 * time.Second, // Max 30 seconds
-		maxReconnectAttempts: 10,               // Kept for compatibility but not enforced - will retry indefinitely
+		reconnectGracePeriod: DefaultReconnectGracePeriod,
+		healthCheckInterval:  DefaultHealthCheckInterval,
+		reconnectDelay:       DefaultReconnectDelay,
+		maxReconnectDelay:    MaxReconnectDelay,
+		maxReconnectAttempts: DefaultMaxReconnectAttempts,
 		logger:               logging.NewComponent(fmt.Sprintf("imap-worker-%s", accountName)),
 		tracer:               nil, // Will be set by SetTracer if tracing is enabled
 	}
@@ -462,6 +485,8 @@ func (w *IMAPWorker) processCommand(cmd *IMAPCommand) {
 		response = w.handleGetStatus(cmd)
 	case CmdRefreshFoldersInBackground:
 		response = w.handleRefreshFoldersInBackground(cmd)
+	case CmdCheckNewMessages:
+		response = w.handleCheckNewMessages(cmd)
 	default:
 		// For now, return "not implemented" for other commands
 		// These will be implemented in subsequent tasks
@@ -475,7 +500,7 @@ func (w *IMAPWorker) processCommand(cmd *IMAPCommand) {
 // requiresConnection checks if a command type requires an active connection
 func (w *IMAPWorker) requiresConnection(cmdType CommandType) bool {
 	switch cmdType {
-	case CmdConnect, CmdDisconnect, CmdHealthCheck:
+	case CmdConnect, CmdDisconnect, CmdHealthCheck, CmdReconnect:
 		return false // These commands can be processed without a connection
 	default:
 		return true // All other commands require a connection
@@ -627,21 +652,39 @@ func (w *IMAPWorker) attemptAutomaticReconnection() {
 	// Use INFO level so we can see this in production logs
 	w.logger.Info("Saved IDLE state before reconnection: active=%v, folder=%s", wasIDLEActive, idleFolder)
 
-	// Wait before attempting reconnection
+	// Wait before attempting reconnection (context-aware so shutdown is prompt)
 	w.logger.Debug("Waiting %v before reconnection attempt", currentDelay)
-	time.Sleep(currentDelay)
+	select {
+	case <-time.After(currentDelay):
+	case <-w.ctx.Done():
+		return
+	}
 
-	// Create reconnect command
+	// Send reconnect command through the command channel so it runs on the
+	// event loop goroutine, preserving the single-goroutine invariant.
 	reconnectCmd := NewCommand(CmdReconnect, nil)
 	reconnectCmd.ResponseCh = make(chan *IMAPResponse, 1)
 
-	// Set a timeout for the reconnection attempt
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), ReconnectionTimeout)
 	defer cancel()
 	reconnectCmd.Context = ctx
 
-	// Attempt reconnection
-	response := w.handleReconnect(reconnectCmd)
+	// Send through channel and wait for the event loop to process it
+	var response *IMAPResponse
+	select {
+	case w.commandCh <- reconnectCmd:
+		select {
+		case response = <-reconnectCmd.ResponseCh:
+			// got response
+		case <-ctx.Done():
+			w.logger.Error("Timeout waiting for reconnection response")
+			return
+		case <-w.ctx.Done():
+			return
+		}
+	case <-w.ctx.Done():
+		return
+	}
 
 	if response.Success {
 		w.logger.Info("Automatic reconnection successful after %d attempts", w.reconnectAttempt)
@@ -686,7 +729,7 @@ func (w *IMAPWorker) attemptAutomaticReconnection() {
 					// Check for messages that arrived while disconnected
 					// IDLE only notifies about changes that happen AFTER it starts monitoring
 					w.logger.Info("Checking for messages that arrived while disconnected for folder: %s", folderToMonitor)
-					w.checkForNewMessages(folderToMonitor)
+					w.sendCheckNewMessagesCommand(folderToMonitor)
 				}
 			case <-ctx.Done():
 				w.logger.Error("Timeout waiting for IDLE start for %s after reconnection", folderToMonitor)
@@ -736,19 +779,24 @@ func (w *IMAPWorker) sendResponse(cmd *IMAPCommand, response *IMAPResponse) {
 func (w *IMAPWorker) cleanup() {
 	w.logger.Debug("Performing worker cleanup for account: %s", w.accountName)
 
+	// Stop IDLE monitoring if active (before closing clients)
+	w.stopIDLEInternal()
+
 	// Disconnect IMAP clients if connected
 	if w.commandClient != nil {
 		w.logger.Debug("Disconnecting command client during cleanup")
-		// Note: We don't wait for graceful disconnect in cleanup to avoid delays
+		if err := w.commandClient.Close(); err != nil {
+			w.logger.Debug("Error closing command client during cleanup: %v", err)
+		}
 		w.commandClient = nil
 	}
 	if w.idleClient != nil {
 		w.logger.Debug("Disconnecting IDLE client during cleanup")
+		if err := w.idleClient.Close(); err != nil {
+			w.logger.Debug("Error closing IDLE client during cleanup: %v", err)
+		}
 		w.idleClient = nil
 	}
-
-	// Stop IDLE monitoring if active
-	w.stopIDLEInternal()
 
 	// Stop health check ticker
 	w.mu.Lock()
@@ -1913,7 +1961,11 @@ func (w *IMAPWorker) recoverStuckIDLE() {
 	w.mu.Unlock()
 
 	// Wait a moment for cleanup
-	time.Sleep(1 * time.Second)
+	select {
+	case <-time.After(1 * time.Second):
+	case <-w.ctx.Done():
+		return
+	}
 
 	// Try to restart IDLE monitoring
 	if err := w.startIDLEInternal(idleFolder); err != nil {
@@ -1940,18 +1992,49 @@ func (w *IMAPWorker) recoverStuckIDLE() {
 
 		// Check for messages that may have been missed while IDLE was stuck
 		w.logger.Info("Checking for messages that may have been missed while IDLE was stuck for folder: %s", idleFolder)
-		w.checkForNewMessages(idleFolder)
+		w.sendCheckNewMessagesCommand(idleFolder)
 	}
 }
 
-// checkForNewMessages compares current folder state with previous state to detect new messages
+// sendCheckNewMessagesCommand sends a CmdCheckNewMessages command through the
+// command channel so that the check runs on the event loop goroutine.
+// Safe to call from any goroutine (IDLE monitor, reconnection, etc.).
+func (w *IMAPWorker) sendCheckNewMessagesCommand(folder string) {
+	cmd := NewCommand(CmdCheckNewMessages, map[string]interface{}{
+		ParamFolderName: folder,
+	})
+	select {
+	case w.commandCh <- cmd:
+		// queued
+	case <-w.ctx.Done():
+		// worker shutting down
+	}
+}
+
+// handleCheckNewMessages handles the CmdCheckNewMessages command on the event loop.
+func (w *IMAPWorker) handleCheckNewMessages(cmd *IMAPCommand) *IMAPResponse {
+	folder, _ := cmd.Parameters[ParamFolderName].(string)
+	if folder == "" {
+		return NewResponse(cmd.ID, false, nil, fmt.Errorf("folder name required"))
+	}
+	w.checkForNewMessages(folder)
+	return NewResponse(cmd.ID, true, nil, nil)
+}
+
+// checkForNewMessages compares current folder state with previous state to detect new messages.
+// Called from the IDLE monitor goroutine (between IDLE cycles) and from
+// CmdCheckNewMessages on the event loop. Access to commandClient is protected
+// by capturing the reference under w.mu.
 func (w *IMAPWorker) checkForNewMessages(folder string) {
-	if w.commandClient == nil {
+	w.mu.RLock()
+	client := w.commandClient
+	w.mu.RUnlock()
+	if client == nil {
 		return
 	}
 
 	// Get current folder status
-	statusCmd := w.commandClient.Status(folder, &imap.StatusOptions{
+	statusCmd := client.Status(folder, &imap.StatusOptions{
 		NumMessages: true,
 		UIDNext:     true,
 	})
@@ -2031,7 +2114,7 @@ func (w *IMAPWorker) checkForNewMessages(folder string) {
 
 			if w.onNewMessage != nil {
 				// Additional safety check: limit the number of notifications sent at once
-				maxNotifications := 10
+				maxNotifications := MaxNewMessageNotifications
 				notificationMessages := newMessages
 				if len(newMessages) > maxNotifications {
 					w.logger.Warn("Limiting notifications to %d messages (found %d new messages) to prevent spam",
@@ -2069,9 +2152,16 @@ func (w *IMAPWorker) fetchNewMessages(folder string, lastUID, currentHighestUID 
 		return nil
 	}
 
+	w.mu.RLock()
+	client := w.commandClient
+	w.mu.RUnlock()
+	if client == nil {
+		return nil
+	}
+
 	// Select folder if not already selected
 	if w.selectedFolder != folder {
-		if _, err := w.commandClient.Select(folder, nil).Wait(); err != nil {
+		if _, err := client.Select(folder, nil).Wait(); err != nil {
 			w.logger.Error("Failed to select folder %s for new message fetch: %v", folder, err)
 			return nil
 		}
@@ -2092,7 +2182,7 @@ func (w *IMAPWorker) fetchNewMessages(folder string, lastUID, currentHighestUID 
 		InternalDate: true, // Fetch actual arrival date from server
 	}
 
-	fetchCmd := w.commandClient.Fetch(uidSet, fetchOptions)
+	fetchCmd := client.Fetch(uidSet, fetchOptions)
 
 	var newMessages []email.Message
 	for {
@@ -2392,8 +2482,12 @@ func (w *IMAPWorker) attemptReconnection() error {
 	// Force disconnect first to clean up any stale connections
 	w.forceDisconnectInternal()
 
-	// Wait a moment for cleanup
-	time.Sleep(100 * time.Millisecond)
+	// Brief pause for cleanup
+	select {
+	case <-time.After(100 * time.Millisecond):
+	case <-w.ctx.Done():
+		return fmt.Errorf("worker stopped during reconnection")
+	}
 
 	// Attempt to reconnect using the connect handler logic
 	connectCmd := NewCommand(CmdConnect, nil)
@@ -2430,10 +2524,11 @@ func (w *IMAPWorker) forceDisconnectInternal() {
 
 	w.mu.Lock()
 	if w.commandClient != nil {
-		// Don't wait for proper close, just set to nil
+		w.commandClient.Close()
 		w.commandClient = nil
 	}
 	if w.idleClient != nil {
+		w.idleClient.Close()
 		w.idleClient = nil
 	}
 	w.selectedFolder = ""

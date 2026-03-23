@@ -16,6 +16,7 @@ import (
 type AccountControllerImpl struct {
 	currentAccount *config.Account
 	isUnifiedInbox bool
+	stateMu        sync.RWMutex // protects currentAccount and isUnifiedInbox
 
 	// IMAP client management
 	accountClients map[string]*imap.ClientWrapper
@@ -44,68 +45,90 @@ func NewAccountController(config config.ConfigManager, cache *cache.Cache) *Acco
 
 // GetCurrentAccount returns the currently selected account
 func (ac *AccountControllerImpl) GetCurrentAccount() *config.Account {
+	ac.stateMu.RLock()
+	defer ac.stateMu.RUnlock()
 	return ac.currentAccount
 }
 
 // SetCurrentAccount sets the currently selected account
 func (ac *AccountControllerImpl) SetCurrentAccount(account *config.Account) {
+	ac.stateMu.Lock()
+	defer ac.stateMu.Unlock()
 	ac.currentAccount = account
 	ac.logger.Debug("Current account set to: %s", account.Name)
 }
 
 // ClearCurrentAccount clears the currently selected account
 func (ac *AccountControllerImpl) ClearCurrentAccount() {
+	ac.stateMu.Lock()
+	defer ac.stateMu.Unlock()
 	ac.currentAccount = nil
 	ac.logger.Debug("Current account cleared")
 }
 
 // IsUnifiedInbox returns whether unified inbox mode is enabled
 func (ac *AccountControllerImpl) IsUnifiedInbox() bool {
+	ac.stateMu.RLock()
+	defer ac.stateMu.RUnlock()
 	return ac.isUnifiedInbox
 }
 
 // SetUnifiedInbox sets the unified inbox mode
 func (ac *AccountControllerImpl) SetUnifiedInbox(enabled bool) {
+	ac.stateMu.Lock()
+	defer ac.stateMu.Unlock()
 	ac.isUnifiedInbox = enabled
 	ac.logger.Debug("Unified inbox mode set to: %v", enabled)
 }
 
 // GetOrCreateIMAPClient gets or creates an IMAP client for the specified account
+// using a default factory that creates a basic (non-traced, unconnected) client.
 func (ac *AccountControllerImpl) GetOrCreateIMAPClient(account *config.Account) (*imap.ClientWrapper, error) {
+	return ac.GetOrCreateIMAPClientWithFactory(account, func(acc *config.Account) (*imap.ClientWrapper, error) {
+		serverConfig := email.ServerConfig{
+			Host:     acc.IMAP.Host,
+			Port:     acc.IMAP.Port,
+			Username: acc.IMAP.Username,
+			Password: acc.IMAP.Password,
+			TLS:      acc.IMAP.TLS,
+		}
+		accountKey := fmt.Sprintf("account_%s", acc.Name)
+		client := imap.NewClientWrapperWithCache(serverConfig, ac.cache, accountKey)
+		return client, nil
+	})
+}
+
+// GetOrCreateIMAPClientWithFactory atomically gets an existing connected client
+// or creates a new one using the provided factory function. The factory is called
+// under the clients lock to prevent duplicate clients for the same account.
+func (ac *AccountControllerImpl) GetOrCreateIMAPClientWithFactory(account *config.Account, factory func(*config.Account) (*imap.ClientWrapper, error)) (*imap.ClientWrapper, error) {
 	ac.clientsMutex.Lock()
 	defer ac.clientsMutex.Unlock()
 
-	// Check if we already have a client for this account
+	// Check if we already have a connected client for this account
 	if client, exists := ac.accountClients[account.Name]; exists {
-		// Check if the client is still connected
 		if client.IsConnected() {
 			ac.logger.Debug("Reusing existing IMAP client for account: %s", account.Name)
 			return client, nil
 		}
-		// Client exists but is disconnected, remove it
+		// Client exists but is disconnected, clean it up
 		ac.logger.Debug("Existing IMAP client for account %s is disconnected, creating new one", account.Name)
+		if err := client.Disconnect(); err != nil {
+			ac.logger.Debug("Error disconnecting stale client for %s: %v", account.Name, err)
+		}
+		client.Stop()
 		delete(ac.accountClients, account.Name)
 	}
 
-	// Create new IMAP client
+	// Create new client via factory
 	ac.logger.Info("Creating new IMAP client for account: %s", account.Name)
-
-	// Convert config.ServerConfig to email.ServerConfig
-	serverConfig := email.ServerConfig{
-		Host:     account.IMAP.Host,
-		Port:     account.IMAP.Port,
-		Username: account.IMAP.Username,
-		Password: account.IMAP.Password,
-		TLS:      account.IMAP.TLS,
+	client, err := factory(account)
+	if err != nil {
+		return nil, err
 	}
-
-	// Create new worker-based IMAP client with cache
-	accountKey := fmt.Sprintf("account_%s", account.Name)
-	client := imap.NewClientWrapperWithCache(serverConfig, ac.cache, accountKey)
 
 	// Store the client
 	ac.accountClients[account.Name] = client
-
 	ac.logger.Info("IMAP client created and stored for account: %s", account.Name)
 	return client, nil
 }
@@ -128,15 +151,23 @@ func (ac *AccountControllerImpl) StoreIMAPClient(accountName string, client *ima
 	ac.logger.Debug("Stored IMAP client for account: %s", accountName)
 }
 
-// ForEachClient executes a function for each IMAP client
+// ForEachClient executes a function for each IMAP client.
+// A snapshot of the clients map is taken before iterating so the callback
+// can safely call methods that acquire clientsMutex without deadlocking.
 func (ac *AccountControllerImpl) ForEachClient(fn func(accountName string, client *imap.ClientWrapper)) {
+	// Take a snapshot under the read lock
 	ac.clientsMutex.RLock()
-	defer ac.clientsMutex.RUnlock()
-
-	for accountName, client := range ac.accountClients {
+	snapshot := make(map[string]*imap.ClientWrapper, len(ac.accountClients))
+	for name, client := range ac.accountClients {
 		if client != nil {
-			fn(accountName, client)
+			snapshot[name] = client
 		}
+	}
+	ac.clientsMutex.RUnlock()
+
+	// Iterate without holding the lock
+	for accountName, client := range snapshot {
+		fn(accountName, client)
 	}
 }
 

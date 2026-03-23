@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/wltechblog/gommail/internal/logging"
@@ -18,6 +19,7 @@ import (
 
 // Cache represents a filesystem-based cache with optional compression
 type Cache struct {
+	mu          sync.RWMutex
 	directory   string
 	compression bool
 	maxSizeMB   int
@@ -49,6 +51,9 @@ func New(directory string, compression bool, maxSizeMB int) *Cache {
 
 // Set stores data in the cache with an optional expiration time
 func (c *Cache) Set(key string, data []byte, expiration time.Duration) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	c.logger.Debug("Setting cache entry: key=%s, size=%d bytes, expiration=%v",
 		key, len(data), expiration)
 
@@ -110,6 +115,14 @@ func (c *Cache) Set(key string, data []byte, expiration time.Duration) error {
 
 // Get retrieves data from the cache
 func (c *Cache) Get(key string) ([]byte, bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.getLocked(key)
+}
+
+// getLocked retrieves data from the cache. Caller must hold c.mu.
+func (c *Cache) getLocked(key string) ([]byte, bool, error) {
 	c.logger.Debug("Getting cache entry: key=%s", key)
 
 	filename := c.getFilename(key)
@@ -162,6 +175,14 @@ func (c *Cache) Get(key string) ([]byte, bool, error) {
 
 // Delete removes an entry from the cache
 func (c *Cache) Delete(key string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.deleteLocked(key)
+}
+
+// deleteLocked removes an entry from the cache. Caller must hold c.mu.
+func (c *Cache) deleteLocked(key string) error {
 	c.logger.Debug("Deleting cache entry: key=%s", key)
 
 	filename := c.getFilename(key)
@@ -184,6 +205,9 @@ func (c *Cache) Delete(key string) error {
 
 // Clear removes all entries from the cache
 func (c *Cache) Clear() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	c.logger.Info("Clearing entire cache directory: %s", c.directory)
 
 	err := os.RemoveAll(c.directory)
@@ -215,6 +239,9 @@ func (c *Cache) Size() (int64, error) {
 
 // Cleanup removes expired entries and enforces size limits
 func (c *Cache) Cleanup() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	// Remove expired entries
 	err := filepath.Walk(c.directory, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
@@ -295,6 +322,14 @@ func (c *Cache) decompress(data []byte) ([]byte, error) {
 
 // ListKeys returns all cache keys that match the given prefix
 func (c *Cache) ListKeys(prefix string) ([]string, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.listKeysLocked(prefix)
+}
+
+// listKeysLocked returns all cache keys that match the given prefix. Caller must hold c.mu.
+func (c *Cache) listKeysLocked(prefix string) ([]string, error) {
 	c.logger.Debug("Listing cache keys with prefix: %s", prefix)
 
 	var keys []string
@@ -334,9 +369,12 @@ func (c *Cache) ListKeys(prefix string) ([]string, error) {
 
 // DeleteByPrefix removes all cache entries that match the given prefix
 func (c *Cache) DeleteByPrefix(prefix string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	c.logger.Debug("Deleting cache entries with prefix: %s", prefix)
 
-	keys, err := c.ListKeys(prefix)
+	keys, err := c.listKeysLocked(prefix)
 	if err != nil {
 		return err
 	}
@@ -345,7 +383,7 @@ func (c *Cache) DeleteByPrefix(prefix string) error {
 	var errors []error
 
 	for _, key := range keys {
-		if err := c.Delete(key); err != nil {
+		if err := c.deleteLocked(key); err != nil {
 			c.logger.Error("Failed to delete cache entry %s: %v", key, err)
 			errors = append(errors, err)
 		} else {

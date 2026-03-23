@@ -45,6 +45,9 @@ const (
 	CmdHealthCheck CommandType = "health_check"
 	CmdGetStatus   CommandType = "get_status"
 
+	// Internal commands (sent by worker goroutines, processed on the event loop)
+	CmdCheckNewMessages CommandType = "check_new_messages"
+
 	// Cache commands
 	CmdGetCachedMessages               CommandType = "get_cached_messages"
 	CmdInvalidateCache                 CommandType = "invalidate_cache"

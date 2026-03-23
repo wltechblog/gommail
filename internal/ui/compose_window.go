@@ -66,6 +66,7 @@ type ComposeOptions struct {
 	Recipients     []email.Address
 	Subject        string
 	Body           string
+	SelectedFrom   string // Pre-select a specific from address (email) in the From dropdown
 	OnSent         func()
 	OnClosed       func()
 }
@@ -286,6 +287,16 @@ func (cw *ComposeWindow) setupContent(opts ComposeOptions) {
 	// Set body
 	if opts.Body != "" {
 		cw.bodyEntry.SetText(opts.Body)
+	}
+
+	// Pre-select a specific from address if provided (e.g. when composing from unified inbox)
+	if opts.SelectedFrom != "" {
+		for _, option := range cw.fromSelect.Options {
+			if strings.Contains(strings.ToLower(option), strings.ToLower(opts.SelectedFrom)) {
+				cw.fromSelect.SetSelected(option)
+				break
+			}
+		}
 	}
 
 	// Handle reply/forward setup

@@ -106,9 +106,9 @@ func (sm *SelectionManagerImpl) SetSelectedMessage(msg *email.MessageIndexItem) 
 // This is called when a message is clicked without modifiers.
 func (sm *SelectionManagerImpl) SelectMessage(index int, messages []email.MessageIndexItem) {
 	sm.selectionMutex.Lock()
-	defer sm.selectionMutex.Unlock()
 
 	if index < 0 || index >= len(messages) {
+		sm.selectionMutex.Unlock()
 		sm.logger.Warn("SelectMessage: Invalid index %d (messageCount=%d)", index, len(messages))
 		return
 	}
@@ -119,12 +119,19 @@ func (sm *SelectionManagerImpl) SelectMessage(index int, messages []email.Messag
 	sm.lastSelectedIndex = index
 	sm.selectedMessage = &messages[index]
 
-	// Trigger callbacks
-	if sm.onSelectionChanged != nil {
-		sm.onSelectionChanged()
+	// Capture callbacks before unlocking so we don't hold the write lock
+	// while the callbacks run. The onSelectionChanged callback triggers a
+	// list Refresh which calls IsMessageSelected (RLock) – if the write lock
+	// were still held the goroutine would deadlock against itself.
+	onSelectionChanged := sm.onSelectionChanged
+	onMessageSelected := sm.onMessageSelected
+	sm.selectionMutex.Unlock()
+
+	if onSelectionChanged != nil {
+		onSelectionChanged()
 	}
-	if sm.onMessageSelected != nil {
-		sm.onMessageSelected(index)
+	if onMessageSelected != nil {
+		onMessageSelected(index)
 	}
 }
 
@@ -135,7 +142,6 @@ func (sm *SelectionManagerImpl) SelectMessageMultiple(index int, ctrlPressed, sh
 	}
 
 	sm.selectionMutex.Lock()
-	defer sm.selectionMutex.Unlock()
 
 	if shiftPressed && sm.lastSelectedIndex >= 0 {
 		// Range selection: select all messages between lastSelectedIndex and current index
@@ -165,66 +171,79 @@ func (sm *SelectionManagerImpl) SelectMessageMultiple(index int, ctrlPressed, sh
 		sm.lastSelectedIndex = index
 	}
 
-	// Update the primary selected message for display
+	// Determine which message to surface for the content pane and the
+	// callback index to report.
+	messageSelectedIdx := -1
 	if sm.selectedMessages[index] {
 		sm.selectedMessage = &messages[index]
-		if sm.onMessageSelected != nil {
-			sm.onMessageSelected(index)
-		}
+		messageSelectedIdx = index
 	} else if len(sm.selectedMessages) > 0 {
-		// If current message was deselected but others are selected, show the first selected one
 		indices := sm.getSelectedMessageIndicesUnsafe()
 		if len(indices) > 0 {
 			sm.selectedMessage = &messages[indices[0]]
-			if sm.onMessageSelected != nil {
-				sm.onMessageSelected(indices[0])
-			}
+			messageSelectedIdx = indices[0]
 		}
 	} else {
-		// No messages selected
 		sm.selectedMessage = nil
 	}
 
-	// Trigger selection changed callback
-	if sm.onSelectionChanged != nil {
-		sm.onSelectionChanged()
+	// Capture callbacks and release the write lock before invoking them.
+	// onSelectionChanged triggers a list Refresh which calls IsMessageSelected
+	// (RLock on the same mutex) – calling it while holding the write lock
+	// causes a self-deadlock on the single Fyne UI thread.
+	onSelectionChanged := sm.onSelectionChanged
+	onMessageSelected := sm.onMessageSelected
+	sm.selectionMutex.Unlock()
+
+	if messageSelectedIdx >= 0 && onMessageSelected != nil {
+		onMessageSelected(messageSelectedIdx)
+	}
+	if onSelectionChanged != nil {
+		onSelectionChanged()
 	}
 }
 
 // SelectAllMessages selects all messages in the current list.
 func (sm *SelectionManagerImpl) SelectAllMessages(messages []email.MessageIndexItem) {
 	sm.selectionMutex.Lock()
-	defer sm.selectionMutex.Unlock()
 
 	sm.selectedMessages = make(map[int]bool)
 	for i := 0; i < len(messages); i++ {
 		sm.selectedMessages[i] = true
 	}
 
+	notifyMessageSelected := false
 	if len(messages) > 0 {
 		sm.selectedMessage = &messages[0]
 		sm.lastSelectedIndex = 0
-		if sm.onMessageSelected != nil {
-			sm.onMessageSelected(0)
-		}
+		notifyMessageSelected = true
 	}
 
-	if sm.onSelectionChanged != nil {
-		sm.onSelectionChanged()
+	onSelectionChanged := sm.onSelectionChanged
+	onMessageSelected := sm.onMessageSelected
+	sm.selectionMutex.Unlock()
+
+	if notifyMessageSelected && onMessageSelected != nil {
+		onMessageSelected(0)
+	}
+	if onSelectionChanged != nil {
+		onSelectionChanged()
 	}
 }
 
 // ClearSelection clears all message selections.
 func (sm *SelectionManagerImpl) ClearSelection() {
 	sm.selectionMutex.Lock()
-	defer sm.selectionMutex.Unlock()
 
 	sm.selectedMessages = make(map[int]bool)
 	sm.selectedMessage = nil
 	sm.lastSelectedIndex = -1
 
-	if sm.onSelectionChanged != nil {
-		sm.onSelectionChanged()
+	onSelectionChanged := sm.onSelectionChanged
+	sm.selectionMutex.Unlock()
+
+	if onSelectionChanged != nil {
+		onSelectionChanged()
 	}
 }
 
