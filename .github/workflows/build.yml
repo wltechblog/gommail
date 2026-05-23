@@ -1,0 +1,50 @@
+name: Build and test
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      GOCACHE: ${{ github.workspace }}/.cache/go-build
+      GOMODCACHE: ${{ github.workspace }}/.cache/pkg/mod
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libxrandr-dev libxinerama-dev libxi-dev libxcursor-dev libgl1-mesa-dev libxxf86vm-dev
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.24.x'
+
+      - name: Cache Go build and module cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ${{ env.GOCACHE }}
+            ${{ env.GOMODCACHE }}
+            ~/.cache/go-build
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Download dependencies
+        run: make deps
+
+      - name: Build application
+        run: make build
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: gommail-binary
+          path: build/gommail
+
+      - name: Run headless tests
+        run: make test-headless

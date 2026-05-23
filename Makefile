@@ -35,6 +35,11 @@ test:
 	@echo "Running tests..."
 	$(GOTEST) -v ./...
 
+# Run headless tests for CI or non-GUI environments
+test-headless:
+	@echo "Running headless tests..."
+	GOMMAIL_HEADLESS=1 $(GOTEST) -v ./...
+
 # Run tests with coverage (excluding debug tools)
 test-coverage:
 	@echo "Running tests with coverage..."

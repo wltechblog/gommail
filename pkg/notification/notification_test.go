@@ -2,11 +2,19 @@ package notification
 
 import (
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/wltechblog/gommail/internal/logging"
 )
+
+func TestMain(m *testing.M) {
+	if os.Getenv("GOMMAIL_HEADLESS") != "" {
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
 
 func TestNewManager(t *testing.T) {
 	config := Config{
