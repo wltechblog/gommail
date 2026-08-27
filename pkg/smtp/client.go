@@ -206,6 +206,12 @@ func (c *Client) sendWithTLS(addr string, auth smtp.Auth, from string, to []stri
 	return writer.Close()
 }
 
+// BuildMessage builds the MIME content of a message. It returns the same
+// content that SendMessage delivers, e.g. for saving a copy to a Sent folder.
+func (c *Client) BuildMessage(msg *email.Message) ([]byte, error) {
+	return c.buildMessage(msg)
+}
+
 // buildMessage constructs the email message using go-message library for proper MIME handling
 func (c *Client) buildMessage(msg *email.Message) ([]byte, error) {
 	var buf bytes.Buffer

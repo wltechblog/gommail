@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"sync"
+
 	"testing"
 	"time"
 
@@ -12,6 +14,7 @@ import (
 
 // MockFolderIMAPClient is a mock implementation of the IMAPClient interface for folder subscription testing
 type MockFolderIMAPClient struct {
+	mu                sync.Mutex
 	allFolders        []email.Folder
 	subscribedFolders []email.Folder
 	subscriptions     map[string]bool
@@ -72,31 +75,43 @@ func (m *MockFolderIMAPClient) StoreSentMessage(sentFolder string, messageConten
 }
 
 func (m *MockFolderIMAPClient) ListSubscribedFolders() ([]email.Folder, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.subscribedFolders, nil
 }
 
 func (m *MockFolderIMAPClient) ListSubscribedFoldersFresh() ([]email.Folder, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.subscribedFolders, nil
 }
 
 func (m *MockFolderIMAPClient) ForceRefreshSubscribedFolders() ([]email.Folder, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.subscribedFolders, nil
 }
 
 func (m *MockFolderIMAPClient) ListAllFolders() ([]email.Folder, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.allFolders, nil
 }
 
 func (m *MockFolderIMAPClient) CreateFolder(name string) error {
+	m.mu.Lock()
 	// Create new folder and add to all folders list
 	newFolder := email.Folder{Name: name, Subscribed: true}
 	m.allFolders = append(m.allFolders, newFolder)
+	m.mu.Unlock()
 
 	// Automatically subscribe to the new folder (as per the real implementation)
 	return m.SubscribeFolder(name)
 }
 
 func (m *MockFolderIMAPClient) DeleteFolder(name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	// Remove from all folders list
 	for i, folder := range m.allFolders {
 		if folder.Name == name {
@@ -120,6 +135,8 @@ func (m *MockFolderIMAPClient) DeleteFolder(name string) error {
 }
 
 func (m *MockFolderIMAPClient) SubscribeFolder(name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.subscriptions[name] = true
 	// Update subscribed folders list
 	for i, folder := range m.allFolders {
@@ -143,6 +160,8 @@ func (m *MockFolderIMAPClient) SubscribeFolder(name string) error {
 }
 
 func (m *MockFolderIMAPClient) UnsubscribeFolder(name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.subscriptions[name] = false
 	// Update subscribed folders list
 	for i, folder := range m.allFolders {
@@ -335,6 +354,11 @@ func TestFolderSubscriptionDialog_SubscribeUnsubscribe(t *testing.T) {
 		t.Error("Drafts should be subscribed in mock client")
 	}
 
+	// Let the background refresh from the subscribe complete before the next
+	// operation (refreshes update dialog state via fyne.Do, which the test
+	// driver executes inline on the spawning goroutine).
+	dialog.refreshWG.Wait()
+
 	// Test unsubscribing from a folder
 	dialog.unsubscribeFromFolder("Sent")
 
@@ -342,6 +366,13 @@ func TestFolderSubscriptionDialog_SubscribeUnsubscribe(t *testing.T) {
 	if mockClient.subscriptions["Sent"] {
 		t.Error("Sent should be unsubscribed in mock client")
 	}
+
+	// Wait for the background subscription-status refresh spawned by the
+	// calls above. The test driver runs fyne.Do callbacks inline on the
+	// spawning goroutine, so an unwritten-to-completion refresh would race
+	// with the next test's widget access (observed as harfbuzz panics under
+	// Fyne 2.8.1).
+	dialog.refreshWG.Wait()
 }
 
 func TestFolderSubscriptionDialog_RefreshFolders(t *testing.T) {
@@ -424,6 +455,11 @@ func TestFolderSubscriptionDialog_CreateFolder(t *testing.T) {
 	testFolderName := "TestFolder"
 	dialog.createFolder(testFolderName)
 
+	// Wait for the background folder-list refresh to finish before asserting
+	// (the test driver executes fyne.Do callbacks inline, so leaving it
+	// running would race this test's widget/render access).
+	dialog.refreshWG.Wait()
+
 	// Verify folder was created and added to all folders
 	allFolders, _ := mockClient.ListAllFolders()
 	if len(allFolders) != initialAllCount+1 {
@@ -488,6 +524,10 @@ func TestFolderSubscriptionDialog_CreateFolderCallsCallback(t *testing.T) {
 	case <-time.After(1 * time.Second):
 		t.Error("Expected onFolderAdded callback to be called after folder creation to refresh main window")
 	}
+
+	// Wait for the dialog's background refresh to complete so it cannot race
+	// with subsequent tests under the test driver's inline fyne.Do handling.
+	dialog.refreshWG.Wait()
 
 	// Verify folder was still created properly
 	allFolders, _ := mockClient.ListAllFolders()

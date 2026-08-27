@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -39,6 +40,12 @@ type FolderSubscriptionDialog struct {
 
 	// State management
 	updatingCheckboxes bool // Flag to prevent recursive checkbox updates
+
+	// refreshWG tracks in-flight background refreshes so callers (notably
+	// tests, where the test driver executes fyne.Do callbacks inline on the
+	// spawning goroutine) can wait for them to finish instead of racing
+	// subsequent widget access.
+	refreshWG sync.WaitGroup
 
 	// Callbacks
 	onClose         func()                  // Called when dialog is closed to refresh main window
@@ -215,7 +222,11 @@ func (fsd *FolderSubscriptionDialog) createUI() {
 // Show displays the folder subscription window
 func (fsd *FolderSubscriptionDialog) Show() {
 	// Load folders when showing the window
-	go fsd.refreshFolders()
+	fsd.refreshWG.Add(1)
+	go func() {
+		defer fsd.refreshWG.Done()
+		fsd.refreshFolders()
+	}()
 	fsd.window.Show()
 }
 
@@ -373,7 +384,11 @@ func (fsd *FolderSubscriptionDialog) subscribeToFolder(folderName string) {
 	})
 
 	// Refresh subscription status
-	go fsd.refreshSubscriptionStatus()
+	fsd.refreshWG.Add(1)
+	go func() {
+		defer fsd.refreshWG.Done()
+		fsd.refreshSubscriptionStatus()
+	}()
 }
 
 // unsubscribeFromFolder unsubscribes from a folder
@@ -395,7 +410,11 @@ func (fsd *FolderSubscriptionDialog) unsubscribeFromFolder(folderName string) {
 	})
 
 	// Refresh subscription status
-	go fsd.refreshSubscriptionStatus()
+	fsd.refreshWG.Add(1)
+	go func() {
+		defer fsd.refreshWG.Done()
+		fsd.refreshSubscriptionStatus()
+	}()
 }
 
 // refreshSubscriptionStatus refreshes only the subscription status without reloading all folders
@@ -406,10 +425,11 @@ func (fsd *FolderSubscriptionDialog) refreshSubscriptionStatus() {
 		return
 	}
 
-	fsd.subscribedFolders = subscribedFolders
-
-	// Set flag to prevent checkbox callback loops during refresh - must be done on UI thread
+	// Set flag to prevent checkbox callback loops during refresh - must be done on UI thread.
+	// The subscription list is updated inside the callback so concurrent
+	// refreshes serialize on the UI thread instead of racing the write.
 	fyne.Do(func() {
+		fsd.subscribedFolders = subscribedFolders
 		fsd.updatingCheckboxes = true
 		fsd.folderList.Refresh()
 		fsd.updatingCheckboxes = false
@@ -515,7 +535,9 @@ func (fsd *FolderSubscriptionDialog) createFolder(folderName string) {
 	})
 
 	// Refresh the folder list to show the new folder, and then refresh main window
+	fsd.refreshWG.Add(1)
 	go func() {
+		defer fsd.refreshWG.Done()
 		fsd.refreshFolders()
 		// After dialog refresh completes, reload the main window folder list
 		// Use the specific callback for folder creation to avoid cache invalidation
@@ -573,7 +595,9 @@ func (fsd *FolderSubscriptionDialog) showDeleteFolderDialog(folderName string) {
 	}
 
 	// First, check if the folder has any messages
+	fsd.refreshWG.Add(1)
 	go func() {
+		defer fsd.refreshWG.Done()
 		messages, err := fsd.imapClient.FetchMessages(folderName, 1) // Just check if there are any messages
 		if err != nil {
 			fsd.logger.Error("Failed to check messages in folder %s: %v", folderName, err)
@@ -820,7 +844,9 @@ func (fsd *FolderSubscriptionDialog) deleteFolder(folderName, targetFolder strin
 	progressDialog.Show()
 
 	// Perform the deletion in a goroutine to avoid blocking the UI
+	fsd.refreshWG.Add(1)
 	go func() {
+		defer fsd.refreshWG.Done()
 		defer progressDialog.Hide()
 
 		// Update status - must be done on UI thread
@@ -889,7 +915,9 @@ func (fsd *FolderSubscriptionDialog) deleteFolder(folderName, targetFolder strin
 		time.Sleep(500 * time.Millisecond)
 
 		// Refresh the folder list to remove the deleted folder with retry logic
+		fsd.refreshWG.Add(1)
 		go func() {
+			defer fsd.refreshWG.Done()
 			maxAttempts := 3
 			for attempt := 1; attempt <= maxAttempts; attempt++ {
 				fsd.logger.Debug("Folder list refresh attempt %d/%d after deletion", attempt, maxAttempts)
@@ -1007,7 +1035,9 @@ func (fsd *FolderSubscriptionDialog) deleteFolderOnly(folderName string) {
 	})
 
 	// Refresh the folder list to remove the deleted folder with retry logic
+	fsd.refreshWG.Add(1)
 	go func() {
+		defer fsd.refreshWG.Done()
 		// Wait a moment for server to process the deletion
 		time.Sleep(500 * time.Millisecond)
 

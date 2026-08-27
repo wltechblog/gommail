@@ -18,6 +18,7 @@ import (
 	"github.com/wltechblog/gommail/internal/addressbook"
 	"github.com/wltechblog/gommail/internal/config"
 	"github.com/wltechblog/gommail/internal/email"
+	"github.com/wltechblog/gommail/internal/logging"
 	"github.com/wltechblog/gommail/pkg/smtp"
 )
 
@@ -26,9 +27,11 @@ type ComposeWindow struct {
 	app    fyne.App
 	window fyne.Window
 	config *config.Config
+	logger *logging.Logger
 
 	// Email components
 	smtpClient     *smtp.Client
+	imapClient     email.IMAPClient
 	account        *config.Account
 	addressbookMgr *addressbook.Manager
 
@@ -59,6 +62,7 @@ type ComposeWindow struct {
 type ComposeOptions struct {
 	Account        *config.Account
 	SMTPClient     *smtp.Client
+	IMAPClient     email.IMAPClient
 	AddressbookMgr *addressbook.Manager
 	ReplyTo        *email.Message
 	ReplyAll       bool // True for reply all, false for regular reply
@@ -80,7 +84,9 @@ func NewComposeWindow(app fyne.App, cfg *config.Config, opts ComposeOptions) *Co
 		app:                 app,
 		window:              window,
 		config:              cfg,
+		logger:              logging.NewComponent("compose"),
 		smtpClient:          opts.SMTPClient,
+		imapClient:          opts.IMAPClient,
 		account:             opts.Account,
 		addressbookMgr:      opts.AddressbookMgr,
 		attachments:         make([]email.Attachment, 0),
@@ -596,6 +602,13 @@ func (cw *ComposeWindow) sendMessage() {
 			err = fmt.Errorf("no SMTP client available")
 		}
 
+		// Save a copy to the Sent folder (non-fatal if it fails)
+		if err == nil {
+			if storeErr := cw.storeSentCopy(msg); storeErr != nil {
+				cw.logger.Error("Failed to save copy to Sent folder: %v", storeErr)
+			}
+		}
+
 		// Update UI on main thread
 		fyne.Do(func() {
 			if err != nil {
@@ -627,6 +640,39 @@ func (cw *ComposeWindow) sendMessage() {
 			}
 		})
 	}()
+}
+
+// storeSentCopy appends a copy of the sent message to the account's Sent folder
+func (cw *ComposeWindow) storeSentCopy(msg *email.Message) error {
+	if cw.account == nil {
+		cw.logger.Debug("Not saving sent copy: no account configured")
+		return nil
+	}
+	if cw.account.SentFolder == "" {
+		cw.logger.Warn("Not saving sent copy: account %s has no Sent folder configured", cw.account.Name)
+		return nil
+	}
+	if cw.imapClient == nil {
+		cw.logger.Warn("Not saving sent copy: no connected IMAP client for account %s", cw.account.Name)
+		return nil
+	}
+	if cw.smtpClient == nil {
+		cw.logger.Warn("Not saving sent copy: no SMTP client for account %s", cw.account.Name)
+		return nil
+	}
+
+	content, err := cw.smtpClient.BuildMessage(msg)
+	if err != nil {
+		return fmt.Errorf("failed to build sent copy: %w", err)
+	}
+
+	if err := cw.imapClient.StoreSentMessage(cw.account.SentFolder, content); err != nil {
+		return fmt.Errorf("failed to store sent copy in folder %s of account %s: %w",
+			cw.account.SentFolder, cw.account.Name, err)
+	}
+
+	cw.logger.Info("Saved sent copy to folder %s of account %s", cw.account.SentFolder, cw.account.Name)
+	return nil
 }
 
 // saveDraft saves the current message as a draft

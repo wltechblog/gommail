@@ -410,6 +410,8 @@ func (l *messageListColumnsLayout) MinSize(objects []fyne.CanvasObject) fyne.Siz
 
 // messageListItem is a custom widget that represents a single message in the list
 // It implements fyne.SecondaryTappable to handle right-click events directly
+// and desktop.Mouseable to capture modifier keys (Ctrl/Shift) for multi-select,
+// which fyne.PointEvent does not carry.
 type messageListItem struct {
 	widget.BaseWidget
 	mainWindow   *MainWindow
@@ -420,6 +422,13 @@ type messageListItem struct {
 	content      *fyne.Container
 	background   *canvas.Rectangle
 	isSelected   bool
+
+	// pendingModifiers holds the modifier state captured by MouseDown for the
+	// click currently in progress. Fyne synthesizes Tapped after MouseUp, so
+	// the modifiers must be stashed at press time and consumed by Tapped.
+	// Event delivery (including the test driver) is single-threaded per
+	// interaction, so no extra locking is needed.
+	pendingModifiers fyne.KeyModifier
 }
 
 // newMessageListItem creates a new message list item widget
@@ -502,6 +511,19 @@ func (m *messageListItem) setSelected(selected bool) {
 	}
 }
 
+// MouseDown captures the modifier keys held when a click starts. fyne's
+// PointEvent does not include modifiers (multi-select remains an open
+// upstream request, fyne-io/fyne#6341), so this is the only reliable place to
+// observe Ctrl/Shift for the ensuing Tapped.
+func (m *messageListItem) MouseDown(me *desktop.MouseEvent) {
+	m.pendingModifiers = me.Modifier
+}
+
+// MouseUp implements desktop.Mouseable. Tapped is synthesized after MouseUp,
+// so pendingModifiers are intentionally kept for Tapped to consume.
+func (m *messageListItem) MouseUp(_ *desktop.MouseEvent) {
+}
+
 // Tapped handles left-click events on the message item
 func (m *messageListItem) Tapped(pe *fyne.PointEvent) {
 	m.mainWindow.logger.Debug("messageListItem.Tapped: Left-click on message ID=%d", m.messageID)
@@ -514,12 +536,13 @@ func (m *messageListItem) Tapped(pe *fyne.PointEvent) {
 
 	m.mainWindow.logger.Debug("messageListItem.Tapped: Selecting message %d: %s", m.messageID, m.mainWindow.messages[m.messageID].Message.Subject)
 
-	// Simple single selection for left-click
-	// Multiple selection will be handled via right-click or keyboard shortcuts
-	ctrlPressed := false
-	shiftPressed := false
+	// Consume the modifiers captured at mouse-down time:
+	// Ctrl+click toggles a message, Shift+click extends a range from the
+	// last selection, plain click collapses to a single selection.
+	ctrlPressed := m.pendingModifiers&fyne.KeyModifierControl != 0
+	shiftPressed := m.pendingModifiers&fyne.KeyModifierShift != 0
+	m.pendingModifiers = 0
 
-	// Use multiple selection logic
 	m.mainWindow.selectMessageMultiple(m.messageID, ctrlPressed, shiftPressed)
 
 	// Also trigger the List widget's selection to keep it in sync
@@ -541,9 +564,12 @@ func (m *messageListItem) TappedSecondary(pe *fyne.PointEvent) {
 
 	m.mainWindow.logger.Debug("messageListItem.TappedSecondary: Right-click on message %d: %s", m.messageID, m.mainWindow.messages[m.messageID].Message.Subject)
 
-	// Right-click can toggle selection in multiple selection mode
-	// If message is not selected, select it (and add to multiple selection if others are selected)
-	// If message is already selected and others are selected, keep all selections
+	// Right-click preserves the existing selection when it acts on a member
+	// of it (so batch context-menu actions work); otherwise it behaves like
+	// a modified click: extend the selection if one exists, or respect
+	// Ctrl for toggle-add.
+	ctrlPressed := m.pendingModifiers&fyne.KeyModifierControl != 0
+	m.pendingModifiers = 0
 	selectedMessages := m.mainWindow.getSelectedMessages()
 	isCurrentlySelected := m.mainWindow.isMessageSelected(m.messageID)
 
@@ -552,7 +578,7 @@ func (m *messageListItem) TappedSecondary(pe *fyne.PointEvent) {
 		m.mainWindow.selectMessageMultiple(m.messageID, true, false) // Ctrl+click behavior
 	} else if !isCurrentlySelected {
 		// Single selection
-		m.mainWindow.selectMessageMultiple(m.messageID, false, false)
+		m.mainWindow.selectMessageMultiple(m.messageID, ctrlPressed, false)
 	}
 	// If already selected, keep the selection as-is
 
@@ -2029,16 +2055,13 @@ func (mw *MainWindow) refreshSingleAccountInUnifiedInbox(accountName string) {
 			return
 		}
 
-		beforeCount := len(mw.messages)
-
 		// Merge new messages with existing ones, avoiding duplicates
-		mw.mergeNewMessagesIntoUnifiedInbox(indexItems)
-
+		stats := mw.mergeNewMessagesIntoUnifiedInbox(indexItems)
 		afterCount := len(mw.messages)
-		addedCount := afterCount - beforeCount
+		changedCount := stats.Added + stats.Replaced
 
-		if addedCount > 0 {
-			mw.logger.Info("Added %d new messages from account %s (total now: %d)", addedCount, accountName, afterCount)
+		if changedCount > 0 {
+			mw.logger.Info("Added %d new messages from account %s (total now: %d)", changedCount, accountName, afterCount)
 
 			// Apply user's sort preferences
 			mw.sortMessages()
@@ -2047,7 +2070,7 @@ func (mw *MainWindow) refreshSingleAccountInUnifiedInbox(accountName string) {
 			mw.messageList.UnselectAll()
 			mw.refreshMessageList()
 
-			mw.statusBar.SetText(fmt.Sprintf("Added %d new messages from %s", addedCount, accountName))
+			mw.statusBar.SetText(fmt.Sprintf("Added %d new messages from %s", changedCount, accountName))
 		} else {
 			mw.logger.Debug("No new messages to add from account %s (all were duplicates)", accountName)
 			mw.statusBar.SetText(fmt.Sprintf("No new messages from %s", accountName))
@@ -2115,65 +2138,41 @@ func (mw *MainWindow) injectNewMessagesIntoUnifiedInboxForAccount(accountName, f
 			return
 		}
 
-		beforeCount := len(mw.messages)
-		mw.mergeNewMessagesIntoUnifiedInbox(indexItems)
+		stats := mw.mergeNewMessagesIntoUnifiedInbox(indexItems)
 		afterCount := len(mw.messages)
-		addedCount := afterCount - beforeCount
+		changedCount := stats.Added + stats.Replaced
 
-		if addedCount > 0 {
-			mw.logger.Info("Injected %d new messages from account %s (total now: %d)", addedCount, accountName, afterCount)
+		if changedCount > 0 {
+			mw.logger.Info("Injected %d new messages from account %s (total now: %d)", changedCount, accountName, afterCount)
 			mw.sortMessages()
 			mw.messageList.UnselectAll()
 			mw.refreshMessageList()
-			mw.statusBar.SetText(fmt.Sprintf("New messages from %s (%d)", accountName, addedCount))
+			mw.statusBar.SetText(fmt.Sprintf("New messages from %s (%d)", accountName, changedCount))
 		} else {
 			mw.logger.Debug("No new messages to inject from account %s (all were duplicates)", accountName)
 		}
 	})
 }
 
-// mergeNewMessagesIntoUnifiedInbox merges new messages into the existing unified inbox, avoiding duplicates
-func (mw *MainWindow) mergeNewMessagesIntoUnifiedInbox(newMessages []email.MessageIndexItem) {
+// mergeNewMessagesIntoUnifiedInbox merges new messages into the existing unified inbox, avoiding duplicates.
+// Returns statistics describing what the merge changed; callers should treat
+// any Added or Replaced entry as a list-changing event (refresh, sort).
+func (mw *MainWindow) mergeNewMessagesIntoUnifiedInbox(newMessages []email.MessageIndexItem) mergeStats {
 	if len(newMessages) == 0 {
 		mw.logger.Debug("mergeNewMessagesIntoUnifiedInbox: No new messages to merge")
-		return
+		return mergeStats{}
 	}
 
 	mw.logger.Info("mergeNewMessagesIntoUnifiedInbox: Starting merge of %d new messages into %d existing messages",
 		len(newMessages), len(mw.messages))
 
-	// Create a map of existing messages by account and UID for efficient duplicate detection
-	existingMap := make(map[string]map[uint32]bool) // account -> uid -> exists
-	for _, msg := range mw.messages {
-		if existingMap[msg.AccountName] == nil {
-			existingMap[msg.AccountName] = make(map[uint32]bool)
-		}
-		existingMap[msg.AccountName][msg.Message.UID] = true
-	}
+	merged, stats := mergeIntoUnifiedInbox(mw.messages, newMessages)
+	mw.messages = merged
 
-	// Add only new messages that don't already exist
-	var addedCount int
-	var duplicateCount int
-	for _, newMsg := range newMessages {
-		// Check if this message already exists
-		if existingMap[newMsg.AccountName] != nil && existingMap[newMsg.AccountName][newMsg.Message.UID] {
-			duplicateCount++
-			continue // Skip duplicate
-		}
+	mw.logger.Info("mergeNewMessagesIntoUnifiedInbox: Merged %d new messages (added %d, replaced %d stale, skipped %d duplicates), total now: %d",
+		stats.Added+stats.Replaced, stats.Added, stats.Replaced, stats.Duplicate, len(mw.messages))
 
-		// Add the new message
-		mw.messages = append(mw.messages, newMsg)
-		addedCount++
-
-		// Update the existing map to track this new message
-		if existingMap[newMsg.AccountName] == nil {
-			existingMap[newMsg.AccountName] = make(map[uint32]bool)
-		}
-		existingMap[newMsg.AccountName][newMsg.Message.UID] = true
-	}
-
-	mw.logger.Info("mergeNewMessagesIntoUnifiedInbox: Merged %d new messages (skipped %d duplicates), total now: %d",
-		addedCount, duplicateCount, len(mw.messages))
+	return stats
 }
 
 // loadUnifiedInboxFromCache loads unified inbox messages from cache
@@ -4059,6 +4058,18 @@ func (mw *MainWindow) showFolderSubscriptionsForAccount(account *config.Account)
 	}()
 }
 
+// imapClientForAccount returns a connected IMAP client for the given account,
+// or nil if none is available. It performs no network I/O.
+func (mw *MainWindow) imapClientForAccount(account *config.Account) email.IMAPClient {
+	if account == nil {
+		return nil
+	}
+	if client, exists := mw.accountController.GetIMAPClientForAccount(account.Name); exists && client != nil && client.IsConnected() {
+		return client
+	}
+	return nil
+}
+
 // getAccountByName returns the account with the given name.
 // Returns nil if the account is not found.
 func (mw *MainWindow) getAccountByName(accountName string) *config.Account {
@@ -4081,16 +4092,10 @@ func (mw *MainWindow) composeMessage() {
 	opts := ComposeOptions{
 		Account:        mw.accountController.GetCurrentAccount(),
 		SMTPClient:     mw.smtpClient,
+		IMAPClient:     mw.imapClientForAccount(mw.accountController.GetCurrentAccount()),
 		AddressbookMgr: mw.addressbookMgr,
 		OnSent: func() {
-			// Use debounced refresh to refresh sent folder after sending
-			if mw.accountController.GetCurrentAccount().SentFolder != "" {
-				mw.refreshMessagesDebounced(mw.accountController.GetCurrentAccount().SentFolder, func(err error) {
-					if err != nil {
-						mw.logger.Error("Failed to refresh sent folder after sending: %v", err)
-					}
-				})
-			}
+			mw.refreshSentFolderAfterSend(mw.accountController.GetCurrentAccount())
 			fyne.Do(func() {
 				mw.statusBar.SetText("Message sent successfully")
 			})
@@ -4102,6 +4107,40 @@ func (mw *MainWindow) composeMessage() {
 
 	composeWindow := NewComposeWindow(mw.app, mw.configManagerToConfig(), opts)
 	composeWindow.Show()
+}
+
+// refreshSentFolderAfterSend refreshes the given account's Sent folder after a
+// successful send, regardless of which inbox view is active.
+//
+// In single-account mode, when the sent folder of the current account is on
+// screen, this triggers a debounced refresh. In unified inbox mode there is no
+// "current account" (the compose account selection dialog is the source of
+// truth), so the sent-folder cache is invalidated instead — the copy was just
+// stored server-side, and the next time the folder is viewed it will be
+// fetched fresh.
+func (mw *MainWindow) refreshSentFolderAfterSend(account *config.Account) {
+	if account == nil || account.SentFolder == "" {
+		return
+	}
+
+	currentAccount := mw.accountController.GetCurrentAccount()
+	if !mw.accountController.IsUnifiedInbox() && currentAccount != nil && currentAccount.Name == account.Name {
+		mw.refreshMessagesDebounced(account.SentFolder, func(err error) {
+			if err != nil {
+				mw.logger.Error("Failed to refresh sent folder after sending: %v", err)
+			}
+		})
+		return
+	}
+
+	// Unified inbox mode (or another account's folder): the Sent folder is not
+	// on screen. Invalidate its cache so the next view picks up the new copy.
+	if client, exists := mw.accountController.GetIMAPClientForAccount(account.Name); exists && client != nil {
+		client.InvalidateMessageCache(account.SentFolder)
+		mw.logger.Debug("Invalidated %s cache for account %s after send", account.SentFolder, account.Name)
+	} else {
+		mw.logger.Warn("Cannot refresh sent folder for account %s: no IMAP client available", account.Name)
+	}
 }
 
 // showAccountSelectionForCompose shows a dialog for selecting a sending account/persona
@@ -4184,16 +4223,11 @@ func (mw *MainWindow) showAccountSelectionForCompose() {
 		opts := ComposeOptions{
 			Account:        account,
 			SMTPClient:     smtpClient,
+			IMAPClient:     mw.imapClientForAccount(account),
 			AddressbookMgr: mw.addressbookMgr,
 			SelectedFrom:   selectedEntry.personalityEmail,
 			OnSent: func() {
-				if account.SentFolder != "" {
-					mw.refreshMessagesDebounced(account.SentFolder, func(err error) {
-						if err != nil {
-							mw.logger.Error("Failed to refresh sent folder after sending: %v", err)
-						}
-					})
-				}
+				mw.refreshSentFolderAfterSend(account)
 				fyne.Do(func() {
 					mw.statusBar.SetText("Message sent successfully")
 				})
@@ -4224,17 +4258,11 @@ func (mw *MainWindow) replyToMessage() {
 	opts := ComposeOptions{
 		Account:        account,
 		SMTPClient:     mw.selectedMessage.SMTPClient.(*smtp.Client),
+		IMAPClient:     mw.imapClientForAccount(account),
 		AddressbookMgr: mw.addressbookMgr,
 		ReplyTo:        &mw.selectedMessage.Message,
 		OnSent: func() {
-			// Use RefreshCoordinator to refresh sent folder after reply
-			if account.SentFolder != "" {
-				mw.refreshMessagesDebounced(account.SentFolder, func(err error) {
-					if err != nil {
-						mw.logger.Error("Failed to refresh sent folder after reply: %v", err)
-					}
-				})
-			}
+			mw.refreshSentFolderAfterSend(account)
 			fyne.Do(func() {
 				mw.statusBar.SetText("Reply sent successfully")
 			})
@@ -4264,18 +4292,12 @@ func (mw *MainWindow) replyAllToMessage() {
 	opts := ComposeOptions{
 		Account:        account,
 		SMTPClient:     mw.selectedMessage.SMTPClient.(*smtp.Client),
+		IMAPClient:     mw.imapClientForAccount(account),
 		AddressbookMgr: mw.addressbookMgr,
 		ReplyTo:        &mw.selectedMessage.Message,
 		ReplyAll:       true, // This is the key difference from regular reply
 		OnSent: func() {
-			// Use RefreshCoordinator to refresh sent folder after reply all
-			if account.SentFolder != "" {
-				mw.refreshMessagesDebounced(account.SentFolder, func(err error) {
-					if err != nil {
-						mw.logger.Error("Failed to refresh sent folder after reply all: %v", err)
-					}
-				})
-			}
+			mw.refreshSentFolderAfterSend(account)
 			fyne.Do(func() {
 				mw.statusBar.SetText("Reply sent successfully")
 			})
@@ -4305,17 +4327,11 @@ func (mw *MainWindow) forwardMessage() {
 	opts := ComposeOptions{
 		Account:        account,
 		SMTPClient:     mw.selectedMessage.SMTPClient.(*smtp.Client),
+		IMAPClient:     mw.imapClientForAccount(account),
 		AddressbookMgr: mw.addressbookMgr,
 		Forward:        &mw.selectedMessage.Message,
 		OnSent: func() {
-			// Use RefreshCoordinator to refresh sent folder after forward
-			if account.SentFolder != "" {
-				mw.refreshMessagesDebounced(account.SentFolder, func(err error) {
-					if err != nil {
-						mw.logger.Error("Failed to refresh sent folder after forward: %v", err)
-					}
-				})
-			}
+			mw.refreshSentFolderAfterSend(account)
 			fyne.Do(func() {
 				mw.statusBar.SetText("Message forwarded successfully")
 			})
@@ -6578,6 +6594,16 @@ func (mw *MainWindow) registerKeyboardShortcuts() {
 	})
 	canvas.AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyDelete, Modifier: fyne.KeyModifierControl}, func(shortcut fyne.Shortcut) {
 		mw.deleteMessage()
+	})
+
+	// Select all / deselect - multi-select support for the message list
+	canvas.AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyA, Modifier: fyne.KeyModifierControl}, func(shortcut fyne.Shortcut) {
+		if len(mw.messages) == 0 {
+			return
+		}
+		mw.selectAllMessages()
+		mw.refreshMessageList()
+		mw.statusBar.SetText(fmt.Sprintf("Selected %d messages", mw.selectionManager.GetSelectionCount()))
 	})
 
 	// View shortcuts

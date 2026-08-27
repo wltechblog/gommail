@@ -345,7 +345,7 @@ func (w *ClientWrapper) SubscribeToDefaultFolders(sentFolder, trashFolder string
 func (w *ClientWrapper) StoreSentMessage(sentFolder string, messageContent []byte) error {
 	cmd := NewCommand(CmdStoreSentMessage, map[string]interface{}{
 		ParamFolderName:     sentFolder,
-		ParamMessageContent: messageContent,
+		ParamMessageContent: string(messageContent),
 	})
 	response, err := w.sendCommandWithTimeout(cmd, w.defaultTimeout)
 	if err != nil {
@@ -376,6 +376,19 @@ func (w *ClientWrapper) SelectFolder(name string) error {
 	return nil
 }
 
+// getBulkFetchTimeout returns the timeout for bulk message fetches.
+// An unlimited fetch (limit 0) must transfer the entire mailbox's envelope
+// set, which can take minutes on large mailboxes (e.g. 25k+ messages).
+// Using the 30s default here causes spurious timeouts whose abandoned
+// commands then block the worker's serial event loop, cascading into
+// timeouts for unrelated commands (start monitoring, mark as read, ...).
+func (w *ClientWrapper) getBulkFetchTimeout(limit int) time.Duration {
+	if limit <= 0 {
+		return 5 * time.Minute
+	}
+	return 2 * time.Minute
+}
+
 // FetchMessages fetches messages from a folder with optional limit
 func (w *ClientWrapper) FetchMessages(folder string, limit int) ([]email.Message, error) {
 	// Try cache first
@@ -398,7 +411,7 @@ func (w *ClientWrapper) FetchMessages(folder string, limit int) ([]email.Message
 	}
 
 	cmd := NewCommand(CmdFetchMessages, params)
-	response, err := w.sendCommandWithTimeout(cmd, w.defaultTimeout)
+	response, err := w.sendCommandWithTimeout(cmd, w.getBulkFetchTimeout(limit))
 	if err != nil {
 		return nil, wrapCommandError("fetch messages", err)
 	}
@@ -596,7 +609,7 @@ func (w *ClientWrapper) FetchFreshMessages(folder string, limit int) ([]email.Me
 	}
 
 	cmd := NewCommand(CmdFetchMessages, params)
-	response, err := w.sendCommandWithTimeout(cmd, w.defaultTimeout)
+	response, err := w.sendCommandWithTimeout(cmd, w.getBulkFetchTimeout(limit))
 	if err != nil {
 		return nil, wrapCommandError("fetch fresh messages", err)
 	}
