@@ -884,4 +884,3 @@ func (w *ClientWrapper) SetHealthCheckInterval(interval time.Duration) {
 func (w *ClientWrapper) SetReconnectConfig(delay, maxDelay time.Duration, maxAttempts int) {
 	w.worker.SetReconnectConfig(delay, maxDelay, maxAttempts)
 }
-
