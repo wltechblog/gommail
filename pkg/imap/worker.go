@@ -97,6 +97,9 @@ type IMAPWorker struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+	// bgWG tracks detached helper goroutines (reconnect attempts, IDLE
+	// monitors) so Stop can wait for them to observe the cancelled context.
+	bgWG sync.WaitGroup
 
 	// Logging
 	logger *logging.Logger
@@ -235,8 +238,22 @@ func (w *IMAPWorker) Stop() error {
 	w.cancel()
 	w.wg.Wait()
 
-	// Close command channel
-	close(w.commandCh)
+	// commandCh and fetchCh are deliberately NOT closed: detached helper
+	// goroutines may still send on them, and a send on a closed channel
+	// panics. Both loops have exited by now, so nothing reads the channels
+	// and they are simply garbage-collected once unreferenced.
+
+	// Wait briefly for detached helpers to observe the cancelled context.
+	done := make(chan struct{})
+	go func() {
+		w.bgWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		w.logger.Warn("Background goroutines did not stop within 3s for account: %s", w.accountName)
+	}
 
 	w.logger.Info("IMAP worker stopped for account: %s", w.accountName)
 	return nil
@@ -257,7 +274,7 @@ func (w *IMAPWorker) StopFast() error {
 
 	w.cancel()
 	close(w.stopCh)
-	close(w.commandCh)
+	// commandCh is not closed: detached senders would panic; see Stop().
 
 	w.logger.Debug("IMAP worker force stopped for account: %s", w.accountName)
 	return nil
@@ -423,23 +440,42 @@ func (w *IMAPWorker) fetchLoop() {
 
 		case <-w.stopCh:
 			w.logger.Debug("Fetch loop stopping for account: %s", w.accountName)
-			// Drain queued fetch commands with an error so waiters aren't stuck
-			for {
-				select {
-				case cmd := <-w.fetchCh:
-					if cmd == nil {
-						return
-					}
-					w.sendResponse(cmd, NewResponse(cmd.ID, false, nil, fmt.Errorf("worker shutting down")))
-				default:
-					return
-				}
-			}
+			w.drainFetchQueue()
+			return
 
 		case <-w.ctx.Done():
+			w.logger.Debug("Fetch loop context cancelled for account: %s", w.accountName)
+			// Drain queued fetch commands with an error so waiters aren't
+			// stuck until their own timeout fires.
+			w.drainFetchQueue()
 			return
 		}
 	}
+}
+
+// drainFetchQueue responds to all queued bulk-fetch commands with a shutdown
+// error so callers waiting on their response channels return promptly.
+func (w *IMAPWorker) drainFetchQueue() {
+	for {
+		select {
+		case cmd := <-w.fetchCh:
+			if cmd == nil {
+				return
+			}
+			w.sendResponse(cmd, NewResponse(cmd.ID, false, nil, fmt.Errorf("worker shutting down")))
+		default:
+			return
+		}
+	}
+}
+
+// bgGo runs fn on a tracked background goroutine so Stop can wait for it.
+func (w *IMAPWorker) bgGo(fn func()) {
+	w.bgWG.Add(1)
+	go func() {
+		defer w.bgWG.Done()
+		fn()
+	}()
 }
 
 // processCommand processes a single command
@@ -757,7 +793,7 @@ func (w *IMAPWorker) attemptAutomaticReconnection() {
 			w.mu.Unlock()
 			w.logger.Info("Scheduling next automatic reconnection attempt in %v after timeout", nextDelay)
 			time.AfterFunc(nextDelay, func() {
-				w.attemptAutomaticReconnection()
+				w.bgGo(w.attemptAutomaticReconnection)
 			})
 			return
 		case <-w.ctx.Done():
@@ -824,7 +860,7 @@ func (w *IMAPWorker) attemptAutomaticReconnection() {
 		// Always schedule another attempt - never give up on an account
 		w.logger.Info("Scheduling next automatic reconnection attempt in %v", currentDelay*2)
 		time.AfterFunc(currentDelay*2, func() {
-			w.attemptAutomaticReconnection()
+			w.bgGo(w.attemptAutomaticReconnection)
 		})
 	}
 }
@@ -840,7 +876,7 @@ func (w *IMAPWorker) sendResponse(cmd *IMAPCommand, response *IMAPResponse) {
 		// - health_check: the health check handler already triggers reconnection
 		if cmd.Type != CmdConnect && cmd.Type != CmdDisconnect && cmd.Type != CmdReconnect && cmd.Type != CmdHealthCheck {
 			w.logger.Info("Connection error detected in command response, attempting automatic reconnection")
-			go w.attemptAutomaticReconnection()
+			w.bgGo(w.attemptAutomaticReconnection)
 		}
 	}
 
@@ -1233,7 +1269,7 @@ func (w *IMAPWorker) handleHealthCheck(cmd *IMAPCommand) *IMAPResponse {
 
 	if w.commandClient == nil {
 		w.logger.Warn("Health check: command client is nil, triggering reconnection")
-		go w.attemptAutomaticReconnection()
+		w.bgGo(w.attemptAutomaticReconnection)
 
 		return NewResponse(cmd.ID, false, map[string]interface{}{
 			DataHealthStatus: w.GetHealthStatus(),
@@ -1250,11 +1286,11 @@ func (w *IMAPWorker) handleHealthCheck(cmd *IMAPCommand) *IMAPResponse {
 		// Check if this is an IDLE monitoring issue
 		if err != nil && strings.Contains(err.Error(), "IDLE monitoring stuck") {
 			w.logger.Warn("IDLE monitoring stuck detected, attempting to restart IDLE")
-			go w.recoverStuckIDLE()
+			w.bgGo(w.recoverStuckIDLE)
 		} else if w.isConnectionError(err) {
 			// If health check fails with connection error, attempt automatic reconnection
 			w.logger.Info("Connection error detected during health check, attempting automatic reconnection")
-			go w.attemptAutomaticReconnection()
+			w.bgGo(w.attemptAutomaticReconnection)
 		}
 	}
 
@@ -1970,7 +2006,7 @@ func (w *IMAPWorker) startIDLEInternal(folder string) error {
 	w.mu.Unlock()
 
 	// Start IDLE monitoring goroutine
-	go w.idleMonitorLoop(ctx, idleCmd, folder)
+	w.bgGo(func() { w.idleMonitorLoop(ctx, idleCmd, folder) })
 
 	return nil
 }
@@ -2058,7 +2094,7 @@ func (w *IMAPWorker) resumeIDLEInternal() error {
 	w.idlePaused = false
 
 	// Start new IDLE monitoring goroutine
-	go w.idleMonitorLoop(ctx, idleCmd, w.idleFolder)
+	w.bgGo(func() { w.idleMonitorLoop(ctx, idleCmd, w.idleFolder) })
 
 	return nil
 }
@@ -2130,7 +2166,7 @@ func (w *IMAPWorker) idleMonitorLoop(ctx context.Context, idleCmd *imapclient.Id
 			// Check if this is a connection error that requires reconnection
 			if w.isConnectionError(err) {
 				w.logger.Info("Connection error detected in IDLE monitoring, attempting automatic reconnection")
-				go w.attemptAutomaticReconnection()
+				w.bgGo(w.attemptAutomaticReconnection)
 				return // Exit the loop, reconnection will restart IDLE if successful
 			}
 		} else {
@@ -2156,7 +2192,7 @@ func (w *IMAPWorker) idleMonitorLoop(ctx context.Context, idleCmd *imapclient.Id
 				// DON'T clear idleActive/idleFolder before reconnection!
 				// The reconnection logic needs to know IDLE was active so it can restart it
 				w.logger.Info("Connection error detected while restarting IDLE, attempting automatic reconnection")
-				go w.attemptAutomaticReconnection()
+				w.bgGo(w.attemptAutomaticReconnection)
 			} else {
 				// Non-connection error - mark IDLE as inactive and stop
 				w.mu.Lock()
@@ -2215,7 +2251,7 @@ func (w *IMAPWorker) recoverStuckIDLE() {
 		// DON'T clear idleActive/idleFolder - let reconnection logic handle IDLE restart
 		if w.isConnectionError(err) {
 			w.logger.Info("IDLE recovery failed with connection error, attempting full reconnection")
-			go w.attemptAutomaticReconnection()
+			w.bgGo(w.attemptAutomaticReconnection)
 		} else {
 			// Non-connection error - clear IDLE state since we can't recover
 			w.mu.Lock()
@@ -2696,7 +2732,7 @@ func (w *IMAPWorker) handleFetchMessage(cmd *IMAPCommand) *IMAPResponse {
 			// Check if this is a connection error
 			if w.isConnectionError(err) {
 				w.logger.Warn("Connection error during folder selection, initiating reconnection")
-				go w.attemptAutomaticReconnection()
+				w.bgGo(w.attemptAutomaticReconnection)
 				return NewResponse(cmd.ID, false, nil, fmt.Errorf("connection error during folder selection: %w", err))
 			}
 			return NewResponse(cmd.ID, false, nil, fmt.Errorf("failed to select folder: %w", err))
@@ -2726,7 +2762,7 @@ func (w *IMAPWorker) handleFetchMessage(cmd *IMAPCommand) *IMAPResponse {
 	if err := noopCmd.Wait(); err != nil {
 		w.logger.Error("Connection health check failed before fetch: %v", err)
 		if w.isConnectionError(err) {
-			go w.attemptAutomaticReconnection()
+			w.bgGo(w.attemptAutomaticReconnection)
 			return NewResponse(cmd.ID, false, nil, fmt.Errorf("connection error before fetch: %w", err))
 		}
 		return NewResponse(cmd.ID, false, nil, fmt.Errorf("connection test failed: %w", err))
@@ -2802,7 +2838,7 @@ func (w *IMAPWorker) handleFetchMessage(cmd *IMAPCommand) *IMAPResponse {
 			// Check if this is a connection error that requires reconnection
 			if w.isConnectionError(result.err) {
 				w.logger.Warn("Connection error detected during fetch: %v", result.err)
-				go w.attemptAutomaticReconnection()
+				w.bgGo(w.attemptAutomaticReconnection)
 				return NewResponse(cmd.ID, false, nil, fmt.Errorf("connection error, reconnection initiated: %w", result.err))
 			}
 			return NewResponse(cmd.ID, false, nil, result.err)
