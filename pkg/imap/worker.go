@@ -704,6 +704,10 @@ func (w *IMAPWorker) attemptAutomaticReconnection() {
 
 	w.mu.Unlock()
 
+	// Surface the reconnecting state immediately so the UI reflects the
+	// outage during the backoff window before CmdReconnect runs.
+	w.setState(ConnectionStateReconnecting, nil)
+
 	// Ensure we clear the reconnecting flag when done
 	defer func() {
 		w.mu.Lock()
@@ -2614,188 +2618,6 @@ func (w *IMAPWorker) getHealthTicker() <-chan time.Time {
 	return nil
 }
 
-// initiateReconnection starts the reconnection process
-func (w *IMAPWorker) initiateReconnection() {
-	w.logger.Debug("Initiating reconnection for account: %s", w.accountName)
-	w.setState(ConnectionStateReconnecting, nil)
-	w.mu.Lock()
-	w.reconnectAttempt = 0
-	w.mu.Unlock()
-
-	// Start reconnection in a separate goroutine to avoid blocking the event loop
-	go w.reconnectionLoop()
-}
-
-// reconnectionLoop handles the reconnection attempts with exponential backoff
-func (w *IMAPWorker) reconnectionLoop() {
-	// Capture IDLE state now, before reconnection clears it, so we can
-	// restart monitoring and detect messages that arrived while offline.
-	w.mu.RLock()
-	wasIDLEActive := w.idleActive
-	savedIDLEFolder := w.idleFolder
-	w.mu.RUnlock()
-
-	for {
-		select {
-		case <-w.ctx.Done():
-			return
-		default:
-		}
-
-		w.mu.Lock()
-		w.reconnectAttempt++
-		currentAttempt := w.reconnectAttempt
-		w.mu.Unlock()
-
-		w.logger.Debug("Reconnection attempt %d for account: %s (will retry indefinitely)", currentAttempt, w.accountName)
-
-		// Attempt to reconnect
-		if err := w.attemptReconnection(); err != nil {
-			w.logger.Error("Reconnection attempt %d failed: %v", currentAttempt, err)
-
-			// Calculate backoff delay with exponential backoff
-			delay := w.calculateBackoffDelay(currentAttempt)
-			w.logger.Debug("Waiting %v before next reconnection attempt", delay)
-
-			select {
-			case <-time.After(delay):
-				continue
-			case <-w.ctx.Done():
-				return
-			}
-		} else {
-			// Reconnection successful
-			w.logger.Debug("Successfully reconnected to IMAP server for account: %s", w.accountName)
-			w.setState(ConnectionStateConnected, nil)
-
-			// Reset reconnection attempt counter
-			w.mu.Lock()
-			w.reconnectAttempt = 0
-			w.mu.Unlock()
-
-			// Trigger reconnected callback
-			if w.onConnectionStateChange != nil {
-				event := ConnectionEvent{
-					State:   ConnectionStateConnected,
-					Error:   nil,
-					Attempt: currentAttempt,
-				}
-				go w.onConnectionStateChange(event)
-			}
-
-			// Determine which folder to monitor.
-			folderToMonitor := savedIDLEFolder
-			if folderToMonitor == "" {
-				folderToMonitor = "INBOX"
-			}
-			w.logger.Info("Restarting IDLE monitoring for folder %s after reconnection (was active before: %v)", folderToMonitor, wasIDLEActive)
-
-			// Restart IDLE via the command channel so it runs on the event loop,
-			// then immediately check for messages that arrived while disconnected.
-			startIDLECmd := NewStartIDLECommand(folderToMonitor)
-			startIDLECmd.ResponseCh = make(chan *IMAPResponse, 1)
-			idleCtx, idleCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			startIDLECmd.Context = idleCtx
-
-			select {
-			case w.commandCh <- startIDLECmd:
-				select {
-				case resp := <-startIDLECmd.ResponseCh:
-					idleCancel()
-					if resp.Success {
-						w.logger.Info("Successfully restarted IDLE monitoring for %s after reconnection", folderToMonitor)
-					} else {
-						w.logger.Error("Failed to restart IDLE for %s after reconnection: %v", folderToMonitor, resp.Error)
-					}
-					// Always check for new messages regardless of IDLE restart outcome –
-					// messages may have arrived while the connection was down.
-					w.logger.Info("Checking for messages that arrived while disconnected for folder: %s", folderToMonitor)
-					w.sendCheckNewMessagesCommand(folderToMonitor)
-				case <-idleCtx.Done():
-					idleCancel()
-					w.logger.Error("Timeout waiting for IDLE restart for %s after reconnection", folderToMonitor)
-					w.sendCheckNewMessagesCommand(folderToMonitor)
-				case <-w.ctx.Done():
-					idleCancel()
-				}
-			case <-w.ctx.Done():
-				idleCancel()
-			case <-time.After(5 * time.Second):
-				idleCancel()
-				w.logger.Error("Failed to queue IDLE start command for %s after reconnection (channel full)", folderToMonitor)
-				w.sendCheckNewMessagesCommand(folderToMonitor)
-			}
-
-			return
-		}
-	}
-}
-
-// attemptReconnection performs a single reconnection attempt
-func (w *IMAPWorker) attemptReconnection() error {
-	// Force disconnect first to clean up any stale connections
-	w.forceDisconnectInternal()
-
-	// Brief pause for cleanup
-	select {
-	case <-time.After(100 * time.Millisecond):
-	case <-w.ctx.Done():
-		return fmt.Errorf("worker stopped during reconnection")
-	}
-
-	// Attempt to reconnect using the connect handler logic
-	connectCmd := NewCommand(CmdConnect, nil)
-	connectCmd.ID = "internal-reconnect"
-	connectCmd.ResponseCh = make(chan *IMAPResponse, 1)
-
-	response := w.handleConnect(connectCmd)
-	if !response.Success {
-		return response.Error
-	}
-
-	return nil
-}
-
-// calculateBackoffDelay calculates the backoff delay for reconnection attempts
-func (w *IMAPWorker) calculateBackoffDelay(attempt int) time.Duration {
-	// Exponential backoff: delay = reconnectDelay * 2^(attempt-1)
-	delay := w.reconnectDelay * time.Duration(1<<uint(attempt-1))
-
-	// Cap at maxReconnectDelay
-	if delay > w.maxReconnectDelay {
-		delay = w.maxReconnectDelay
-	}
-
-	return delay
-}
-
-// forceDisconnectInternal forcibly closes the connection without proper cleanup
-func (w *IMAPWorker) forceDisconnectInternal() {
-	w.logger.Debug("Force disconnecting from IMAP server")
-
-	// Stop IDLE monitoring if active
-	w.stopIDLEInternal()
-
-	w.mu.Lock()
-	if w.commandClient != nil {
-		w.commandClient.Close()
-		w.commandClient = nil
-	}
-	if w.idleClient != nil {
-		w.idleClient.Close()
-		w.idleClient = nil
-	}
-	if w.fetchClient != nil {
-		w.fetchClient.Close()
-		w.fetchClient = nil
-	}
-	w.selectedFolder = ""
-	w.fetchSelectedFolder = ""
-	w.mu.Unlock()
-
-	w.setState(ConnectionStateDisconnected, nil)
-}
-
 // SetHealthCheckInterval configures the health check interval
 func (w *IMAPWorker) SetHealthCheckInterval(interval time.Duration) {
 	w.mu.Lock()
@@ -2874,7 +2696,7 @@ func (w *IMAPWorker) handleFetchMessage(cmd *IMAPCommand) *IMAPResponse {
 			// Check if this is a connection error
 			if w.isConnectionError(err) {
 				w.logger.Warn("Connection error during folder selection, initiating reconnection")
-				w.initiateReconnection()
+				go w.attemptAutomaticReconnection()
 				return NewResponse(cmd.ID, false, nil, fmt.Errorf("connection error during folder selection: %w", err))
 			}
 			return NewResponse(cmd.ID, false, nil, fmt.Errorf("failed to select folder: %w", err))
@@ -2904,7 +2726,7 @@ func (w *IMAPWorker) handleFetchMessage(cmd *IMAPCommand) *IMAPResponse {
 	if err := noopCmd.Wait(); err != nil {
 		w.logger.Error("Connection health check failed before fetch: %v", err)
 		if w.isConnectionError(err) {
-			w.initiateReconnection()
+			go w.attemptAutomaticReconnection()
 			return NewResponse(cmd.ID, false, nil, fmt.Errorf("connection error before fetch: %w", err))
 		}
 		return NewResponse(cmd.ID, false, nil, fmt.Errorf("connection test failed: %w", err))
@@ -2980,7 +2802,7 @@ func (w *IMAPWorker) handleFetchMessage(cmd *IMAPCommand) *IMAPResponse {
 			// Check if this is a connection error that requires reconnection
 			if w.isConnectionError(result.err) {
 				w.logger.Warn("Connection error detected during fetch: %v", result.err)
-				w.initiateReconnection()
+				go w.attemptAutomaticReconnection()
 				return NewResponse(cmd.ID, false, nil, fmt.Errorf("connection error, reconnection initiated: %w", result.err))
 			}
 			return NewResponse(cmd.ID, false, nil, result.err)
