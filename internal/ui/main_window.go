@@ -1511,7 +1511,7 @@ func (mw *MainWindow) clearMessageSelection() {
 	mw.selectedMessage = nil
 	mw.messagesMu.Unlock()
 	if mw.messageList != nil {
-		mw.clearMessageSelection()
+		mw.messageList.UnselectAll()
 	}
 }
 

@@ -1382,3 +1382,34 @@ func TestLoadUnifiedInboxFromCacheReportsEmptyCacheHit(t *testing.T) {
 		t.Fatalf("expected no unified inbox messages, got %#v", got)
 	}
 }
+
+// TestClearMessageSelectionTerminates guards against re-entrancy in the
+// selection-clearing helper: a bulk rename once rewrote its own
+// UnselectAll call into a self-call, sending the UI thread into infinite
+// recursion (and a CPU pegged at 100%) as soon as a folder reload ran.
+func TestClearMessageSelectionTerminates(t *testing.T) {
+	mw := &MainWindow{
+		logger:           logging.NewComponent("ui-test"),
+		selectionManager: controllers.NewSelectionManager(),
+		messageList:      widget.NewList(func() int { return 0 }, func() fyne.CanvasObject { return widget.NewLabel("") }, func(widget.ListItemID, fyne.CanvasObject) {}),
+	}
+	mw.selectionManager.SelectMessageMultiple(0, false, false, mw.messages)
+
+	done := make(chan struct{})
+	go func() {
+		mw.clearMessageSelection()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("clearMessageSelection did not return (re-entrant loop?)")
+	}
+
+	if mw.selectionManager.GetSelectionCount() != 0 {
+		t.Error("selection manager not cleared")
+	}
+	if mw.selectedMessage != nil {
+		t.Error("selected message not cleared")
+	}
+}
