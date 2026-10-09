@@ -243,8 +243,15 @@ func (ae *AutocompleteEntry) showDropdown() {
 	// PopUp is added to the overlay stack) can manage its focus. Without it,
 	// canvas.Focused() returns nil while the overlay is visible and all
 	// keystrokes are silently discarded.
+	//
+	// Stack order matters: Fyne's hit-test walks children in order and the
+	// LAST matching object at the pointer position wins the click. The proxy
+	// is Focusable and stretched to the full stack size, so listing it after
+	// the dropdown made it swallow every click before the list could see it;
+	// keeping it first leaves the dropdown as the final (winning) match while
+	// it stays focusable for keyboard input.
 	ae.dropdownPopup = widget.NewPopUp(
-		container.NewStack(ae.dropdown, ae.proxy),
+		container.NewStack(ae.proxy, ae.dropdown),
 		ae.canvas,
 	)
 
