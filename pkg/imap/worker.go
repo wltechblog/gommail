@@ -44,19 +44,20 @@ type IMAPWorker struct {
 	stopCh    chan struct{}
 
 	// Worker state (protected by mutex for external access)
-	mu             sync.RWMutex
-	state          ConnectionState
-	selectedFolder string
-	idleActive     bool
-	idlePaused     bool
-	idleFolder     string
-	idleTimeout    time.Duration
-	idleCmd        *imapclient.IdleCommand
-	idleCancel     context.CancelFunc
-	lastActivity   time.Time
-	commandsQueued int
-	reconnectCount int
-	errorCount     int
+	mu                     sync.RWMutex
+	state                  ConnectionState
+	selectedFolder         string
+	idleActive             bool
+	idlePaused             bool
+	idleFolder             string
+	idleTimeout            time.Duration
+	newMessageCheckTimeout time.Duration
+	idleCmd                *imapclient.IdleCommand
+	idleCancel             context.CancelFunc
+	lastActivity           time.Time
+	commandsQueued         int
+	reconnectCount         int
+	errorCount             int
 
 	// IDLE monitoring state
 	lastMessageCount map[string]uint32
@@ -124,6 +125,12 @@ const (
 	DefaultMaxReconnectAttempts = 10
 	// MaxNewMessageNotifications caps the number of notifications per check.
 	MaxNewMessageNotifications = 10
+	// NewMessageCheckTimeout bounds a new-message check (SELECT plus a small
+	// envelope fetch). The check runs on the event loop with no command
+	// context, so a stalled server would otherwise freeze every command for
+	// the account; the watchdog closes the connection to unblock it, and the
+	// resulting connection error triggers the normal reconnection path.
+	NewMessageCheckTimeout = 60 * time.Second
 	// MaxNewMessageRetries bounds the short-delay re-checks scheduled when a
 	// new message was signalled but could not be fetched yet. After exhausting
 	// the retries, the regular IDLE timeout remains as a backstop.
@@ -147,20 +154,21 @@ func NewIMAPWorker(config *email.ServerConfig, accountName, cacheKey string, cac
 		fetchCh:      make(chan *IMAPCommand, DefaultCommandChBuffer),
 		idleUpdateCh: make(chan struct{}, 1),
 		// stopCh and ctx will be created in Start()
-		state:                ConnectionStateDisconnected,
-		idleTimeout:          DefaultIDLETimeout,
-		lastMessageCount:     make(map[string]uint32),
-		lastHighestUID:       make(map[string]uint32),
-		initialSyncDone:      make(map[string]bool),
-		newMsgRetryCount:     make(map[string]int),
-		newMsgRetryScheduled: make(map[string]bool),
-		reconnectGracePeriod: DefaultReconnectGracePeriod,
-		healthCheckInterval:  DefaultHealthCheckInterval,
-		reconnectDelay:       DefaultReconnectDelay,
-		maxReconnectDelay:    MaxReconnectDelay,
-		maxReconnectAttempts: DefaultMaxReconnectAttempts,
-		logger:               logging.NewComponent(fmt.Sprintf("imap-worker-%s", accountName)),
-		tracer:               nil, // Will be set by SetTracer if tracing is enabled
+		state:                  ConnectionStateDisconnected,
+		idleTimeout:            DefaultIDLETimeout,
+		newMessageCheckTimeout: NewMessageCheckTimeout,
+		lastMessageCount:       make(map[string]uint32),
+		lastHighestUID:         make(map[string]uint32),
+		initialSyncDone:        make(map[string]bool),
+		newMsgRetryCount:       make(map[string]int),
+		newMsgRetryScheduled:   make(map[string]bool),
+		reconnectGracePeriod:   DefaultReconnectGracePeriod,
+		healthCheckInterval:    DefaultHealthCheckInterval,
+		reconnectDelay:         DefaultReconnectDelay,
+		maxReconnectDelay:      MaxReconnectDelay,
+		maxReconnectAttempts:   DefaultMaxReconnectAttempts,
+		logger:                 logging.NewComponent(fmt.Sprintf("imap-worker-%s", accountName)),
+		tracer:                 nil, // Will be set by SetTracer if tracing is enabled
 	}
 
 	// Load persistent tracking state from cache
@@ -2309,6 +2317,22 @@ func (w *IMAPWorker) checkForNewMessages(folder string) {
 		return
 	}
 
+	// The blocking IMAP operations below run on the event loop with no
+	// command context; watchdog them so a stalled server cannot freeze the
+	// whole account (the health check is queued behind this loop and could
+	// not otherwise notice).
+	checkDone := make(chan struct{})
+	defer close(checkDone)
+	go func(c *imapclient.Client) {
+		select {
+		case <-checkDone:
+		case <-time.After(w.newMessageCheckTimeout):
+			w.logger.Warn("New-message check for folder %s exceeded %v; closing the connection to unblock the event loop",
+				folder, w.newMessageCheckTimeout)
+			c.Close()
+		}
+	}(client)
+
 	// Observe the mailbox with a fresh SELECT. RFC 9051 §6.3.11 discourages
 	// STATUS on the currently selected mailbox, and some servers answer it
 	// with stale select-time data — which made push-triggered checks silently
@@ -2394,7 +2418,9 @@ func (w *IMAPWorker) checkForNewMessages(folder string) {
 					Count:     len(notificationMessages),
 					Timestamp: time.Now(),
 				}
-				callback(event)
+				// Dispatch off the event loop so a slow consumer cannot
+				// stall every IMAP command for the account.
+				w.bgGo(func() { callback(event) })
 			}
 		} else if currentHighestUID > lastUID {
 			// fetchNewMessages returned nothing despite a UID change. This typically

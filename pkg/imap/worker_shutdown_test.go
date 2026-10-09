@@ -1,9 +1,13 @@
 package imap
 
 import (
+	"io"
+	"net"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/wltechblog/gommail/internal/email"
 )
 
@@ -60,5 +64,42 @@ func TestStopIsIdempotent(t *testing.T) {
 	}
 	if err := w.StopFast(); err != nil {
 		t.Fatalf("StopFast after Stop failed: %v", err)
+	}
+}
+
+// TestNewMessageCheckWatchdogUnblocksStalledServer verifies that a server
+// which accepts the connection but never answers SELECT cannot freeze the
+// new-message check forever: the watchdog closes the connection and the
+// check returns.
+func TestNewMessageCheckWatchdogUnblocksStalledServer(t *testing.T) {
+	w := NewIMAPWorker(&email.ServerConfig{
+		Host: "fake", Port: 993, Username: "user", Password: "pass", TLS: true,
+	}, "stalled-account", "stalled-key", nil)
+	if err := w.Start(); err != nil {
+		t.Fatalf("failed to start worker: %v", err)
+	}
+	defer w.Stop()
+	w.newMessageCheckTimeout = 300 * time.Millisecond
+
+	conn, srv := net.Pipe()
+	go func() {
+		writeLine(srv, "* OK [CAPABILITY IMAP4rev1] stalled ready")
+		io.Copy(io.Discard, srv) // read and discard; never answer commands
+	}()
+	defer conn.Close()
+	w.commandClient = imapclient.New(conn, &imapclient.Options{})
+	w.setState(ConnectionStateConnected, nil)
+
+	done := make(chan struct{})
+	go func() {
+		w.checkForNewMessages("INBOX")
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// The check returned: the watchdog closed the stalled connection.
+	case <-time.After(5 * time.Second):
+		t.Fatal("checkForNewMessages did not return; stalled server froze it")
 	}
 }
