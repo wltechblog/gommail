@@ -2749,24 +2749,8 @@ func (w *IMAPWorker) handleFetchMessage(cmd *IMAPCommand) *IMAPResponse {
 	// No need to pause IDLE - we have separate connections now
 
 	// Select folder if not already selected
-	if w.selectedFolder != folderName {
-		w.logger.Debug("Selecting folder %s (currently selected: %s)", folderName, w.selectedFolder)
-		selectData, err := w.commandClient.Select(folderName, nil).Wait()
-		if err != nil {
-			w.logger.Error("Failed to select folder %s: %v", folderName, err)
-			w.incrementErrorCount()
-			// Check if this is a connection error
-			if w.isConnectionError(err) {
-				w.logger.Warn("Connection error during folder selection, initiating reconnection")
-				w.bgGo(w.attemptAutomaticReconnection)
-				return NewResponse(cmd.ID, false, nil, fmt.Errorf("connection error during folder selection: %w", err))
-			}
-			return NewResponse(cmd.ID, false, nil, fmt.Errorf("failed to select folder: %w", err))
-		}
-		w.logger.Debug("Successfully selected folder %s, messages: %d, recent: %d", folderName, selectData.NumMessages, selectData.NumRecent)
-		w.mu.Lock()
-		w.selectedFolder = folderName
-		w.mu.Unlock()
+	if err := w.ensureSelected(folderName); err != nil {
+		return NewResponse(cmd.ID, false, nil, err)
 	}
 
 	// Check context before starting fetch
@@ -2916,66 +2900,49 @@ func (w *IMAPWorker) handleGetCachedMessages(cmd *IMAPCommand) *IMAPResponse {
 	}, nil)
 }
 
-// handleMarkAsRead handles the mark as read command
-func (w *IMAPWorker) handleMarkAsRead(cmd *IMAPCommand) *IMAPResponse {
-	w.logger.Debug("Handling mark as read command")
-
-	if w.commandClient == nil {
-		return NewResponse(cmd.ID, false, nil, fmt.Errorf("not connected"))
+// ensureSelected selects folderName on the command connection when it is
+// not already selected, recording the new selection under w.mu. Connection
+// errors route into the standard automatic-reconnection path.
+func (w *IMAPWorker) ensureSelected(folderName string) error {
+	if w.selectedFolder == folderName {
+		return nil
 	}
-
-	folderName, ok := cmd.GetString(ParamFolderName)
-	if !ok {
-		return NewResponse(cmd.ID, false, nil, fmt.Errorf("folder name not provided"))
-	}
-
-	uid, ok := cmd.GetUint32(ParamUID)
-	if !ok {
-		return NewResponse(cmd.ID, false, nil, fmt.Errorf("message UID not provided"))
-	}
-
-	w.logger.Debug("Marking message UID %d as read in folder: %s", uid, folderName)
-
-	// Select folder if not already selected
-	if w.selectedFolder != folderName {
-		_, err := w.commandClient.Select(folderName, nil).Wait()
-		if err != nil {
-			w.logger.Error("Failed to select folder %s: %v", folderName, err)
-			w.incrementErrorCount()
-			return NewResponse(cmd.ID, false, nil, fmt.Errorf("failed to select folder: %w", err))
-		}
-		w.mu.Lock()
-		w.selectedFolder = folderName
-		w.mu.Unlock()
-	}
-
-	// Create UID set for single message
-	uidSet := imap.UIDSetNum(imap.UID(uid))
-
-	// Add \Seen flag
-	storeCmd := w.commandClient.Store(uidSet, &imap.StoreFlags{
-		Op:    imap.StoreFlagsAdd,
-		Flags: []imap.Flag{imap.FlagSeen},
-	}, nil)
-
-	// Consume any returned data (we don't need it for flag operations)
-	for storeCmd.Next() != nil {
-		// Just consume the data
-	}
-
-	if err := storeCmd.Close(); err != nil {
-		w.logger.Error("Failed to mark message UID %d as read: %v", uid, err)
+	_, err := w.commandClient.Select(folderName, nil).Wait()
+	if err != nil {
+		w.logger.Error("Failed to select folder %s: %v", folderName, err)
 		w.incrementErrorCount()
-		return NewResponse(cmd.ID, false, nil, fmt.Errorf("failed to mark message as read: %w", err))
+		if w.isConnectionError(err) {
+			w.logger.Warn("Connection error during folder selection, initiating reconnection")
+			w.bgGo(w.attemptAutomaticReconnection)
+			return fmt.Errorf("connection error during folder selection: %w", err)
+		}
+		return fmt.Errorf("failed to select folder: %w", err)
 	}
-
-	w.logger.Debug("Successfully marked message UID %d as read", uid)
-	return NewResponse(cmd.ID, true, nil, nil)
+	w.mu.Lock()
+	w.selectedFolder = folderName
+	w.mu.Unlock()
+	return nil
 }
 
-// handleMarkAsUnread handles the mark as unread command
+// handleMarkAsRead marks a message as read (\Seen add).
+func (w *IMAPWorker) handleMarkAsRead(cmd *IMAPCommand) *IMAPResponse {
+	return w.handleSetSeen(cmd, true)
+}
+
+// handleMarkAsUnread marks a message as unread (\Seen remove).
 func (w *IMAPWorker) handleMarkAsUnread(cmd *IMAPCommand) *IMAPResponse {
-	w.logger.Debug("Handling mark as unread command")
+	return w.handleSetSeen(cmd, false)
+}
+
+// handleSetSeen adds or removes the \Seen flag for one message. The two
+// public handlers used to be byte-identical apart from the store operation.
+func (w *IMAPWorker) handleSetSeen(cmd *IMAPCommand, seen bool) *IMAPResponse {
+	action := "read"
+	op := imap.StoreFlagsAdd
+	if !seen {
+		action = "unread"
+		op = imap.StoreFlagsDel
+	}
 
 	if w.commandClient == nil {
 		return NewResponse(cmd.ID, false, nil, fmt.Errorf("not connected"))
@@ -2991,42 +2958,29 @@ func (w *IMAPWorker) handleMarkAsUnread(cmd *IMAPCommand) *IMAPResponse {
 		return NewResponse(cmd.ID, false, nil, fmt.Errorf("message UID not provided"))
 	}
 
-	w.logger.Debug("Marking message UID %d as unread in folder: %s", uid, folderName)
+	w.logger.Debug("Marking message UID %d as %s in folder: %s", uid, action, folderName)
 
-	// Select folder if not already selected
-	if w.selectedFolder != folderName {
-		_, err := w.commandClient.Select(folderName, nil).Wait()
-		if err != nil {
-			w.logger.Error("Failed to select folder %s: %v", folderName, err)
-			w.incrementErrorCount()
-			return NewResponse(cmd.ID, false, nil, fmt.Errorf("failed to select folder: %w", err))
-		}
-		w.mu.Lock()
-		w.selectedFolder = folderName
-		w.mu.Unlock()
+	if err := w.ensureSelected(folderName); err != nil {
+		return NewResponse(cmd.ID, false, nil, err)
 	}
 
-	// Create UID set for single message
 	uidSet := imap.UIDSetNum(imap.UID(uid))
-
-	// Remove \Seen flag
 	storeCmd := w.commandClient.Store(uidSet, &imap.StoreFlags{
-		Op:    imap.StoreFlagsDel,
+		Op:    op,
 		Flags: []imap.Flag{imap.FlagSeen},
 	}, nil)
 
-	// Consume any returned data
+	// Consume any returned data (not needed for flag operations)
 	for storeCmd.Next() != nil {
-		// Just consume the data
 	}
 
 	if err := storeCmd.Close(); err != nil {
-		w.logger.Error("Failed to mark message UID %d as unread: %v", uid, err)
+		w.logger.Error("Failed to mark message UID %d as %s: %v", uid, action, err)
 		w.incrementErrorCount()
-		return NewResponse(cmd.ID, false, nil, fmt.Errorf("failed to mark message as unread: %w", err))
+		return NewResponse(cmd.ID, false, nil, fmt.Errorf("failed to mark message as %s: %w", action, err))
 	}
 
-	w.logger.Debug("Successfully marked message UID %d as unread", uid)
+	w.logger.Debug("Successfully marked message UID %d as %s", uid, action)
 	return NewResponse(cmd.ID, true, nil, nil)
 }
 
@@ -3050,17 +3004,8 @@ func (w *IMAPWorker) handleDeleteMessage(cmd *IMAPCommand) *IMAPResponse {
 
 	w.logger.Debug("Deleting message UID %d from folder: %s", uid, folderName)
 
-	// Select folder if not already selected
-	if w.selectedFolder != folderName {
-		_, err := w.commandClient.Select(folderName, nil).Wait()
-		if err != nil {
-			w.logger.Error("Failed to select folder %s: %v", folderName, err)
-			w.incrementErrorCount()
-			return NewResponse(cmd.ID, false, nil, fmt.Errorf("failed to select folder: %w", err))
-		}
-		w.mu.Lock()
-		w.selectedFolder = folderName
-		w.mu.Unlock()
+	if err := w.ensureSelected(folderName); err != nil {
+		return NewResponse(cmd.ID, false, nil, err)
 	}
 
 	// Create UID set for single message
@@ -3126,16 +3071,8 @@ func (w *IMAPWorker) handleMoveMessage(cmd *IMAPCommand) *IMAPResponse {
 	w.logger.Debug("Moving message UID %d from folder %s to %s", uid, folderName, targetFolder)
 
 	// Select source folder if not already selected
-	if w.selectedFolder != folderName {
-		_, err := w.commandClient.Select(folderName, nil).Wait()
-		if err != nil {
-			w.logger.Error("Failed to select folder %s: %v", folderName, err)
-			w.incrementErrorCount()
-			return NewResponse(cmd.ID, false, nil, fmt.Errorf("failed to select folder: %w", err))
-		}
-		w.mu.Lock()
-		w.selectedFolder = folderName
-		w.mu.Unlock()
+	if err := w.ensureSelected(folderName); err != nil {
+		return NewResponse(cmd.ID, false, nil, err)
 	}
 
 	// Create UID set for single message
@@ -3258,13 +3195,9 @@ func (w *IMAPWorker) searchMessagesInFolder(folderName string, criteria *email.S
 	}
 
 	if w.selectedFolder != folderName {
-		_, err := w.commandClient.Select(folderName, nil).Wait()
-		if err != nil {
-			return nil, fmt.Errorf("failed to select folder: %w", err)
+		if err := w.ensureSelected(folderName); err != nil {
+			return nil, err
 		}
-		w.mu.Lock()
-		w.selectedFolder = folderName
-		w.mu.Unlock()
 		w.logger.Debug("Selected folder %s for search", folderName)
 	}
 
