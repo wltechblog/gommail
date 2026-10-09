@@ -125,8 +125,3 @@ func IsFirstRunWithApp(app fyne.App, profile string) bool {
 
 	return isFirst
 }
-
-// Default returns a default configuration compatible with both systems
-func DefaultConfig() *Config {
-	return Default()
-}

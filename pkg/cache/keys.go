@@ -52,30 +52,6 @@ func GenerateAccountKey(accountKey, keyType, identifier string) string {
 	return GenerateKey(accountKey, keyType, identifier)
 }
 
-// GenerateMessagesKey creates a cache key for messages in a folder
-// Format: accountKey:messages:folderName
-func GenerateMessagesKey(accountKey, folderName string) string {
-	return GenerateKey(accountKey, KeyTypeMessages, folderName)
-}
-
-// GenerateFoldersKey creates a cache key for folder list
-// Format: accountKey:folders:list
-func GenerateFoldersKey(accountKey string) string {
-	return GenerateKey(accountKey, KeyTypeFolders, "list")
-}
-
-// GenerateSubscribedFoldersKey creates a cache key for subscribed folders
-// Format: accountKey:folders:subscribed
-func GenerateSubscribedFoldersKey(accountKey string) string {
-	return GenerateKey(accountKey, KeyTypeFoldersSubscribed)
-}
-
-// GenerateTrackingStateKey creates a cache key for folder tracking state
-// Format: accountKey:tracking_state:identifier
-func GenerateTrackingStateKey(accountKey, identifier string) string {
-	return GenerateKey(accountKey, KeyTypeTrackingState, identifier)
-}
-
 // GenerateAttachmentKey creates a cache key for attachment data
 // Format: attachment:attachmentID
 func GenerateAttachmentKey(attachmentID string) string {
@@ -88,35 +64,3 @@ func GenerateAttachmentMetaKey(attachmentID string) string {
 	return fmt.Sprintf("%s:%s", KeyTypeAttachmentMeta, attachmentID)
 }
 
-// GenerateAddressbookKey creates a cache key for addressbook data
-// Format: addressbook:accountKey
-func GenerateAddressbookKey(accountKey string) string {
-	return GenerateKey(KeyTypeAddressbook, accountKey)
-}
-
-// ParseKey splits a cache key into its components
-// This is useful for debugging and logging
-func ParseKey(key string) []string {
-	if key == "" {
-		return nil
-	}
-
-	// Count colons to pre-allocate slice
-	colonCount := 0
-	for i := 0; i < len(key); i++ {
-		if key[i] == ':' {
-			colonCount++
-		}
-	}
-
-	components := make([]string, 0, colonCount+1)
-	start := 0
-	for i := 0; i < len(key); i++ {
-		if key[i] == ':' {
-			components = append(components, key[start:i])
-			start = i + 1
-		}
-	}
-	components = append(components, key[start:])
-	return components
-}

@@ -38,7 +38,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -54,7 +53,6 @@ import (
 	ttwidget "github.com/dweymouth/fyne-tooltip/widget"
 	"github.com/skratchdot/open-golang/open"
 
-	"github.com/PuerkitoBio/goquery"
 	"github.com/wltechblog/gommail/internal/addressbook"
 	"github.com/wltechblog/gommail/internal/config"
 	"github.com/wltechblog/gommail/internal/email"
@@ -67,14 +65,6 @@ import (
 	"github.com/wltechblog/gommail/pkg/notification"
 	"github.com/wltechblog/gommail/pkg/smtp"
 )
-
-// min returns the minimum of two integers
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
 
 func accountCacheKey(accountName string) string {
 	return fmt.Sprintf("account_%s", accountName)
@@ -1390,74 +1380,10 @@ func (mw *MainWindow) convertMessagesToIndexItems(messages []email.Message, fold
 	return mw.messageListController.ConvertMessagesToIndexItems(messages, folderName)
 }
 
-// setSortBy changes the sort criteria and refreshes the message list
-// Delegates to MessageListController
-func (mw *MainWindow) setSortBy(sortBy SortBy) {
-	// Convert MainWindow SortBy to controller SortBy
-	var controllerSortBy controllers.SortBy
-	switch sortBy {
-	case SortByDate:
-		controllerSortBy = controllers.SortByDate
-	case SortBySender:
-		controllerSortBy = controllers.SortBySender
-	case SortBySubject:
-		controllerSortBy = controllers.SortBySubject
-	default:
-		controllerSortBy = controllers.SortByDate
-	}
-
-	// Update controller's IMAP/SMTP clients and messages before sorting
-	mw.messageListController.SetIMAPClient(mw.imapClient)
-	mw.messageListController.SetSMTPClient(mw.smtpClient)
-	mw.messageListController.SetMessages(mw.messages)
-
-	// Delegate to controller
-	mw.messageListController.SetSortBy(controllerSortBy)
-
-	// Sync back to MainWindow
-	mw.messages = mw.messageListController.GetMessages()
-	mw.sortBy = sortBy
-	mw.sortOrder = SortOrder(mw.messageListController.GetSortOrder())
-}
-
 // getSortName returns a human-readable name for the current sort criteria
 // Delegates to MessageListController
 func (mw *MainWindow) getSortName() string {
 	return mw.messageListController.GetSortName()
-}
-
-// updateSortButtons updates the sort button text to reflect current state
-// Delegates to MessageListController
-func (mw *MainWindow) updateSortButtons() {
-	mw.messageListController.UpdateSortButtons()
-}
-
-// updateColumnHeaders updates the column header buttons to show current sort state
-// Delegates to MessageListController
-func (mw *MainWindow) updateColumnHeaders() {
-	mw.messageListController.UpdateColumnHeaders()
-}
-
-// showSortMenu displays a menu to select sort criteria
-// Delegates to MessageListController
-func (mw *MainWindow) showSortMenu() {
-	mw.messageListController.ShowSortMenu()
-}
-
-// toggleSortOrder toggles between ascending and descending sort order
-// Delegates to MessageListController
-func (mw *MainWindow) toggleSortOrder() {
-	// Update controller's IMAP/SMTP clients and messages before toggling
-	mw.messageListController.SetIMAPClient(mw.imapClient)
-	mw.messageListController.SetSMTPClient(mw.smtpClient)
-	mw.messageListController.SetMessages(mw.messages)
-
-	// Delegate to controller
-	mw.messageListController.ToggleSortOrder()
-
-	// Sync back to MainWindow
-	mw.messages = mw.messageListController.GetMessages()
-	mw.sortOrder = SortOrder(mw.messageListController.GetSortOrder())
 }
 
 // clearAccountState clears the current account state when switching accounts
@@ -1707,12 +1633,6 @@ func (mw *MainWindow) syncFolderSubscriptionsInBackground(accountName string, cl
 			})
 		}
 	}()
-}
-
-// foldersChanged compares two folder lists to detect changes
-// Delegates to FolderController
-func (mw *MainWindow) foldersChanged(current, updated []email.Folder) bool {
-	return mw.folderController.FoldersChanged(current, updated)
 }
 
 // selectUnifiedInbox handles unified inbox selection by showing cached data first
@@ -2643,59 +2563,10 @@ func (mw *MainWindow) selectFolderWithOptions(folder string, forceRefresh bool) 
 	}()
 }
 
-// getFolderMessageCount returns the message count for a folder from the folder list
-// Delegates to FolderController
-func (mw *MainWindow) getFolderMessageCount(folderName string) int {
-	return mw.folderController.GetFolderMessageCount(folderName)
-}
-
 // updateFolderMessageCount updates the message count for a folder in the folder list
 // Delegates to FolderController
 func (mw *MainWindow) updateFolderMessageCount(folderName string, newCount int) {
 	mw.folderController.UpdateFolderMessageCount(folderName, newCount)
-}
-
-// loadSampleMessages creates sample messages for demonstration
-func (mw *MainWindow) loadSampleMessages() {
-	now := time.Now()
-	sampleMessages := []email.Message{
-		{
-			ID:      "msg1",
-			Subject: "Welcome to the new email client",
-			From:    []email.Address{{Name: "System", Email: "system@example.com"}},
-			To:      []email.Address{{Name: mw.accountController.GetCurrentAccount().Name, Email: mw.accountController.GetCurrentAccount().IMAP.Username}},
-			Date:    now.Add(-2 * time.Hour),
-			Body:    email.MessageBody{Text: "Welcome to your new email client! This is a sample message."},
-			Flags:   []string{"\\Seen"},
-		},
-		{
-			ID:      "msg2",
-			Subject: "Re: Welcome to the new email client",
-			From:    []email.Address{{Name: "User", Email: "user@example.com"}},
-			To:      []email.Address{{Name: mw.accountController.GetCurrentAccount().Name, Email: mw.accountController.GetCurrentAccount().IMAP.Username}},
-			Date:    now.Add(-1 * time.Hour),
-			Body:    email.MessageBody{Text: "Thank you for the welcome message!"},
-			Headers: map[string]string{"In-Reply-To": "msg1"},
-		},
-		{
-			ID:      "msg3",
-			Subject: "Important: Phase 2 Implementation Complete",
-			From:    []email.Address{{Name: "Developer", Email: "dev@example.com"}},
-			To:      []email.Address{{Name: mw.accountController.GetCurrentAccount().Name, Email: mw.accountController.GetCurrentAccount().IMAP.Username}},
-			Date:    now,
-			Body:    email.MessageBody{Text: "Phase 2 implementation is now complete with threading, SMTP enhancements, and attachment handling!"},
-			Attachments: []email.Attachment{
-				{
-					Filename:    "implementation_notes.txt",
-					ContentType: "text/plain",
-					Size:        1024,
-					Data:        []byte("Implementation details..."),
-				},
-			},
-		},
-	}
-
-	mw.messages = mw.convertMessagesToIndexItems(sampleMessages, "INBOX")
 }
 
 // validateMessageArrayConsistency performs validation checks on the message array
@@ -3030,12 +2901,6 @@ func (mw *MainWindow) selectMessageMultiple(index int, ctrlPressed, shiftPressed
 	if mw.selectedMessage == nil {
 		mw.updateMessageViewer("Select a message to view")
 	}
-}
-
-// getSelectedMessageIndicesUnsafe returns selected indices without locking (for internal use when already locked)
-// This method is deprecated and kept for backward compatibility
-func (mw *MainWindow) getSelectedMessageIndicesUnsafe() []int {
-	return mw.selectionManager.GetSelectedMessageIndices()
 }
 
 // clearSelection clears all message selections
@@ -3537,357 +3402,6 @@ func (mw *MainWindow) showImageFullSize(attachment email.Attachment, attachmentI
 	imageDialog.Show()
 }
 
-// formatTextForMarkdown formats plain text for proper markdown display
-func (mw *MainWindow) formatTextForMarkdown(text string) string {
-	// Replace single line breaks with double line breaks for markdown
-	// This ensures paragraphs are properly separated
-	lines := strings.Split(text, "\n")
-	var formattedLines []string
-
-	for i, line := range lines {
-		trimmedLine := strings.TrimSpace(line)
-
-		// If this is an empty line, keep it as a paragraph separator
-		if trimmedLine == "" {
-			formattedLines = append(formattedLines, "")
-			continue
-		}
-
-		// Add the line
-		formattedLines = append(formattedLines, trimmedLine)
-
-		// Add an extra empty line after non-empty lines to create proper paragraph breaks
-		// unless the next line is already empty or we're at the end
-		if i < len(lines)-1 {
-			nextLine := strings.TrimSpace(lines[i+1])
-			if nextLine != "" {
-				formattedLines = append(formattedLines, "")
-			}
-		}
-	}
-
-	return strings.Join(formattedLines, "\n")
-}
-
-// htmlToPlainText converts HTML content to plain text with aggressive CSS filtering
-func (mw *MainWindow) htmlToPlainText(html string) string {
-	// Check if this looks like mostly CSS content by counting CSS-like patterns
-	cssPatterns := []string{
-		"border:", "margin:", "padding:", "font-size:", "color:", "background:",
-		"display:", "width:", "height:", "text-decoration:", "line-height:",
-		"font-family:", "font-weight:", "text-align:", "border-collapse:",
-		"webkit-text-size-adjust:", "ms-text-size-adjust:", "!important",
-	}
-
-	cssCount := 0
-	for _, pattern := range cssPatterns {
-		if strings.Contains(html, pattern) {
-			cssCount++
-		}
-	}
-
-	// If we detect lots of CSS patterns, try to extract meaningful content
-	if cssCount > 5 { // Lower threshold to catch more CSS-heavy content
-		// Split into lines and filter out CSS-heavy lines
-		lines := strings.Split(html, "\n")
-		var contentLines []string
-
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-
-			// Skip lines that are clearly CSS or styling
-			isCSSLine := false
-
-			// Check for CSS patterns
-			for _, pattern := range cssPatterns {
-				if strings.Contains(line, pattern) {
-					isCSSLine = true
-					break
-				}
-			}
-
-			// Additional CSS/styling patterns to skip
-			if !isCSSLine {
-				// Skip lines with CSS-like syntax
-				if strings.Contains(line, "{") || strings.Contains(line, "}") ||
-					strings.HasSuffix(line, ";") && len(line) < 200 ||
-					strings.Contains(line, "px") && strings.Contains(line, ":") ||
-					strings.Contains(line, "rgb(") || strings.Contains(line, "rgba(") ||
-					strings.Contains(line, "#") && len(line) < 50 ||
-					strings.Contains(line, "class=") || strings.Contains(line, "style=") ||
-					strings.Contains(line, "font-") || strings.Contains(line, "text-") ||
-					strings.Contains(line, "border-") || strings.Contains(line, "margin-") ||
-					strings.Contains(line, "padding-") || strings.Contains(line, "background-") ||
-					strings.Contains(line, "webkit-") || strings.Contains(line, "moz-") ||
-					strings.Contains(line, "ms-") || strings.Contains(line, "-o-") {
-					isCSSLine = true
-				}
-			}
-
-			// Keep lines that look like actual content
-			if !isCSSLine && len(line) > 10 {
-				// Remove any remaining HTML tags from this line
-				cleanLine := regexp.MustCompile(`<[^>]*>`).ReplaceAllString(line, "")
-				cleanLine = strings.TrimSpace(cleanLine)
-
-				// Additional filtering for content quality
-				if cleanLine != "" && len(cleanLine) > 5 {
-					// Skip lines that are mostly symbols or very short
-					letterCount := 0
-					for _, r := range cleanLine {
-						if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
-							letterCount++
-						}
-					}
-
-					// Only keep lines with reasonable letter content
-					if letterCount > 3 && float64(letterCount)/float64(len(cleanLine)) > 0.3 {
-						contentLines = append(contentLines, cleanLine)
-					}
-				}
-			}
-		}
-
-		if len(contentLines) > 0 {
-			result := strings.Join(contentLines, "\n")
-			// Clean up HTML entities
-			result = mw.decodeHTMLEntities(result)
-			return result
-		}
-	}
-
-	// Fallback to standard HTML processing
-	return mw.standardHTMLToText(html)
-}
-
-// decodeHTMLEntities decodes common HTML entities
-func (mw *MainWindow) decodeHTMLEntities(text string) string {
-	text = strings.ReplaceAll(text, "&nbsp;", " ")
-	text = strings.ReplaceAll(text, "&amp;", "&")
-	text = strings.ReplaceAll(text, "&lt;", "<")
-	text = strings.ReplaceAll(text, "&gt;", ">")
-	text = strings.ReplaceAll(text, "&quot;", "\"")
-	text = strings.ReplaceAll(text, "&#39;", "'")
-	text = strings.ReplaceAll(text, "&apos;", "'")
-	text = strings.ReplaceAll(text, "&#8217;", "'")
-	text = strings.ReplaceAll(text, "&#8220;", "\"")
-	text = strings.ReplaceAll(text, "&#8221;", "\"")
-	text = strings.ReplaceAll(text, "&#8211;", "-")
-	text = strings.ReplaceAll(text, "&#8212;", "—")
-	return text
-}
-
-// standardHTMLToText performs standard HTML to text conversion
-func (mw *MainWindow) standardHTMLToText(html string) string {
-	// Remove CSS style blocks and inline styles
-	cssBlockRegex := regexp.MustCompile(`(?s)<style[^>]*>.*?</style>`)
-	plainText := cssBlockRegex.ReplaceAllString(html, "")
-
-	// Remove script blocks
-	scriptBlockRegex := regexp.MustCompile(`(?s)<script[^>]*>.*?</script>`)
-	plainText = scriptBlockRegex.ReplaceAllString(plainText, "")
-
-	// Remove HTML comments
-	commentRegex := regexp.MustCompile(`(?s)<!--.*?-->`)
-	plainText = commentRegex.ReplaceAllString(plainText, "")
-
-	// Convert common block elements to line breaks before removing tags
-	blockElements := []string{"div", "p", "br", "h1", "h2", "h3", "h4", "h5", "h6", "li", "tr"}
-	for _, element := range blockElements {
-		// Convert opening and closing tags to line breaks
-		openTagRegex := regexp.MustCompile(`(?i)<` + element + `[^>]*>`)
-		plainText = openTagRegex.ReplaceAllString(plainText, "\n")
-		closeTagRegex := regexp.MustCompile(`(?i)</` + element + `>`)
-		plainText = closeTagRegex.ReplaceAllString(plainText, "\n")
-	}
-
-	// Handle self-closing br tags specifically
-	brRegex := regexp.MustCompile(`(?i)<br\s*/?>\s*`)
-	plainText = brRegex.ReplaceAllString(plainText, "\n")
-
-	// Remove all remaining HTML tags
-	htmlTagRegex := regexp.MustCompile(`<[^>]*>`)
-	plainText = htmlTagRegex.ReplaceAllString(plainText, "")
-
-	// Decode HTML entities
-	plainText = mw.decodeHTMLEntities(plainText)
-
-	// Clean up excessive whitespace and line breaks
-	plainText = regexp.MustCompile(`[ \t]+`).ReplaceAllString(plainText, " ")
-	plainText = regexp.MustCompile(`\n\s*\n\s*\n+`).ReplaceAllString(plainText, "\n\n")
-	plainText = regexp.MustCompile(`^\s+|\s+$`).ReplaceAllString(plainText, "")
-
-	return plainText
-}
-
-// htmlToMarkdown converts HTML content to markdown for rich text display using goquery
-func (mw *MainWindow) htmlToMarkdown(html string) string {
-	// Use goquery for proper HTML parsing
-	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
-	if err != nil {
-		// Fallback to simple text extraction if parsing fails
-		return mw.extractTextFromHTML(html)
-	}
-
-	// Remove style and script elements completely
-	doc.Find("style, script").Remove()
-
-	var result strings.Builder
-
-	// Process the document recursively
-	mw.processHTMLNode(doc.Selection, &result, 0)
-
-	content := result.String()
-
-	// Clean up excessive whitespace while preserving intentional formatting
-	content = regexp.MustCompile(`[ \t]+`).ReplaceAllString(content, " ")
-	content = regexp.MustCompile(`\n\s*\n\s*\n+`).ReplaceAllString(content, "\n\n")
-	content = strings.TrimSpace(content)
-
-	return content
-}
-
-// TestHTMLToMarkdown is a helper function for testing HTML to markdown conversion
-func (mw *MainWindow) TestHTMLToMarkdown(html string) string {
-	return mw.htmlToMarkdown(html)
-}
-
-// processHTMLNode recursively processes HTML nodes and converts them to markdown
-func (mw *MainWindow) processHTMLNode(s *goquery.Selection, result *strings.Builder, depth int) {
-	s.Contents().Each(func(i int, child *goquery.Selection) {
-		if goquery.NodeName(child) == "#text" {
-			// Text node - add the text content with proper spacing
-			text := child.Text()
-			if text != "" {
-				// Preserve spaces but normalize whitespace
-				text = strings.ReplaceAll(text, "\n", " ")
-				text = strings.ReplaceAll(text, "\t", " ")
-				// Collapse multiple spaces but preserve single spaces
-				for strings.Contains(text, "  ") {
-					text = strings.ReplaceAll(text, "  ", " ")
-				}
-				result.WriteString(text)
-			}
-		} else {
-			// Element node - handle based on tag type
-			tagName := goquery.NodeName(child)
-			switch strings.ToLower(tagName) {
-			case "h1":
-				result.WriteString("\n\n# ")
-				mw.processHTMLNode(child, result, depth+1)
-				result.WriteString("\n\n")
-			case "h2":
-				result.WriteString("\n\n## ")
-				mw.processHTMLNode(child, result, depth+1)
-				result.WriteString("\n\n")
-			case "h3":
-				result.WriteString("\n\n### ")
-				mw.processHTMLNode(child, result, depth+1)
-				result.WriteString("\n\n")
-			case "h4":
-				result.WriteString("\n\n#### ")
-				mw.processHTMLNode(child, result, depth+1)
-				result.WriteString("\n\n")
-			case "h5":
-				result.WriteString("\n\n##### ")
-				mw.processHTMLNode(child, result, depth+1)
-				result.WriteString("\n\n")
-			case "h6":
-				result.WriteString("\n\n###### ")
-				mw.processHTMLNode(child, result, depth+1)
-				result.WriteString("\n\n")
-			case "p":
-				result.WriteString("\n\n")
-				mw.processHTMLNode(child, result, depth+1)
-				result.WriteString("\n\n")
-			case "br":
-				result.WriteString("\n")
-			case "strong", "b":
-				result.WriteString("**")
-				mw.processHTMLNode(child, result, depth+1)
-				result.WriteString("**")
-			case "em", "i":
-				result.WriteString("*")
-				mw.processHTMLNode(child, result, depth+1)
-				result.WriteString("*")
-			case "a":
-				href, exists := child.Attr("href")
-				if exists {
-					// Get the text content of the link
-					var linkTextBuilder strings.Builder
-					mw.processHTMLNode(child, &linkTextBuilder, depth+1)
-					linkText := strings.TrimSpace(linkTextBuilder.String())
-
-					// If no meaningful text content, try to get alt text from images or use a generic label
-					if linkText == "" {
-						if alt, hasAlt := child.Find("img").First().Attr("alt"); hasAlt && alt != "" {
-							linkText = alt
-						} else if child.Find("img").Length() > 0 {
-							linkText = "Image Link"
-						} else {
-							linkText = "Link"
-						}
-					}
-
-					result.WriteString("[")
-					result.WriteString(linkText)
-					result.WriteString("](")
-					result.WriteString(href)
-					result.WriteString(")")
-				} else {
-					mw.processHTMLNode(child, result, depth+1)
-				}
-			case "ul", "ol":
-				result.WriteString("\n\n")
-				mw.processHTMLNode(child, result, depth+1)
-				result.WriteString("\n\n")
-			case "li":
-				result.WriteString("- ")
-				mw.processHTMLNode(child, result, depth+1)
-				result.WriteString("\n")
-			case "blockquote":
-				result.WriteString("\n\n> ")
-				mw.processHTMLNode(child, result, depth+1)
-				result.WriteString("\n\n")
-			case "code":
-				result.WriteString("`")
-				mw.processHTMLNode(child, result, depth+1)
-				result.WriteString("`")
-			case "pre":
-				result.WriteString("\n\n```\n")
-				mw.processHTMLNode(child, result, depth+1)
-				result.WriteString("\n```\n\n")
-			case "div":
-				mw.processHTMLNode(child, result, depth+1)
-				result.WriteString("\n")
-			case "style", "script", "head", "meta", "title", "link", "noscript":
-				// Skip these elements entirely - they contain metadata, not content
-				// Don't process their children
-			case "img":
-				// For images, try to use alt text if available
-				if alt, exists := child.Attr("alt"); exists && alt != "" {
-					result.WriteString(alt)
-				}
-			default:
-				// For other elements, just process their content
-				mw.processHTMLNode(child, result, depth+1)
-			}
-		}
-	})
-}
-
-// extractTextFromHTML is a fallback function for simple text extraction
-func (mw *MainWindow) extractTextFromHTML(html string) string {
-	// Simple fallback - remove all HTML tags and decode entities
-	content := regexp.MustCompile(`<[^>]*>`).ReplaceAllString(html, "")
-	content = mw.decodeHTMLEntities(content)
-	content = strings.TrimSpace(content)
-	return content
-}
-
 // formatAddresses formats a slice of addresses for display
 func (mw *MainWindow) formatAddresses(addresses []email.Address) string {
 	if len(addresses) == 0 {
@@ -3931,24 +3445,6 @@ func (mw *MainWindow) getDisplayDate(msg *email.Message) time.Time {
 
 	// Return in local timezone for user-friendly display
 	return displayDate.Local()
-}
-
-// getSortDate returns the date for sorting purposes, normalized to UTC
-// This ensures consistent sorting regardless of timezone
-func (mw *MainWindow) getSortDate(msg *email.Message) time.Time {
-	var sortDate time.Time
-
-	// Use InternalDate if available (actual arrival date from IMAP server - cannot be forged)
-	if !msg.InternalDate.IsZero() {
-		sortDate = msg.InternalDate
-	} else {
-		// Fallback to Date header (can be forged by spammers)
-		sortDate = msg.Date
-	}
-
-	// Normalize to UTC for consistent sorting and comparison
-	// This ensures messages from different timezones are properly ordered
-	return sortDate.UTC()
 }
 
 // Toolbar action methods
@@ -4797,15 +4293,6 @@ func (mw *MainWindow) showMessageContextMenu() {
 	mw.showCustomContextMenuAtPosition(menuPos)
 }
 
-// handleRightClickAtPosition handles right-click at a specific position
-func (mw *MainWindow) handleRightClickAtPosition(pos fyne.Position) {
-	mw.logger.Debug("Handling right-click at position: %v", pos)
-	// For now, we'll show the context menu for the currently selected message
-	// In a more advanced implementation, we could calculate which message was clicked
-	// based on the position and the list item height
-	mw.showMessageContextMenuAtPosition(pos)
-}
-
 // showMessageContextMenuAtPosition shows the context menu at a specific position
 func (mw *MainWindow) showMessageContextMenuAtPosition(pos fyne.Position) {
 	if mw.selectedMessage == nil {
@@ -4935,21 +4422,6 @@ func (mw *MainWindow) createContextMenuButton(text string, onTapped func()) *wid
 	button.Importance = widget.LowImportance     // Remove button styling/background
 
 	return button
-}
-
-// dismissContextMenu helper function to properly dismiss any open context menu
-func (mw *MainWindow) dismissContextMenu() {
-	// This function is now mainly for backward compatibility
-	// The new custom popup menus are dismissed directly via popup.Hide()
-	// but we keep this for any remaining native menu usage
-	go func() {
-		// Small delay to allow menu action to complete
-		time.Sleep(50 * time.Millisecond)
-		fyne.Do(func() {
-			// Focus the message list which may help dismiss any remaining native menus
-			mw.window.Canvas().Focus(mw.messageList)
-		})
-	}()
 }
 
 // showMoveToFolderDialog shows a dialog to select a folder to move the message to
@@ -6072,66 +5544,6 @@ func (mw *MainWindow) cacheAttachmentIfNeeded(msg *email.Message, attachment ema
 	return attachmentID
 }
 
-// createInlineAttachmentDisplay creates markdown content for displaying an attachment inline
-func (mw *MainWindow) createInlineAttachmentDisplay(attachment email.Attachment, attachmentID string, index int) string {
-	var content strings.Builder
-
-	// Attachment header with icon
-	icon := mw.getAttachmentIcon(attachment.ContentType)
-	content.WriteString(fmt.Sprintf("### %s %s\n", icon, attachment.Filename))
-	content.WriteString(fmt.Sprintf("**Type:** %s | **Size:** %s\n\n",
-		attachment.ContentType, formatFileSize(attachment.Size)))
-
-	// Preview content for supported types
-	if mw.attachmentManager != nil && attachmentID != "" {
-		previewContent := mw.generateAttachmentPreview(attachment, attachmentID)
-		if previewContent != "" {
-			content.WriteString(previewContent)
-		}
-	}
-
-	// Status information
-	if mw.isPreviewableType(attachment.ContentType) {
-		content.WriteString("*This attachment can be previewed and saved using the toolbar or context menu*\n\n")
-	} else {
-		content.WriteString("*This attachment can be saved using the toolbar or context menu*\n\n")
-	}
-
-	return content.String()
-}
-
-// generateAttachmentPreview generates preview content for supported attachment types
-func (mw *MainWindow) generateAttachmentPreview(attachment email.Attachment, attachmentID string) string {
-	if mw.attachmentManager == nil || attachmentID == "" {
-		return ""
-	}
-
-	// Get preview data
-	previewData, err := mw.attachmentManager.GetAttachmentPreview(attachmentID, 500) // 500 chars max
-	if err != nil {
-		return ""
-	}
-
-	var content strings.Builder
-
-	// Handle different content types
-	if strings.HasPrefix(attachment.ContentType, "text/") {
-		content.WriteString("**Preview:**\n```\n")
-		preview := string(previewData)
-		if len(preview) > 500 {
-			preview = preview[:500] + "..."
-		}
-		content.WriteString(preview)
-		content.WriteString("\n```\n\n")
-	} else if strings.HasPrefix(attachment.ContentType, "image/") {
-		content.WriteString("**Image Preview:** *Image preview available - click View Full Size to see the image*\n\n")
-	} else {
-		content.WriteString("**Binary Content:** *Preview not available for this file type*\n\n")
-	}
-
-	return content.String()
-}
-
 // getAttachmentIcon returns an emoji icon for the attachment content type
 func (mw *MainWindow) getAttachmentIcon(contentType string) string {
 	switch {
@@ -6156,20 +5568,6 @@ func (mw *MainWindow) getAttachmentIcon(contentType string) string {
 	default:
 		return "📎"
 	}
-}
-
-// isPreviewableType checks if an attachment type can be previewed
-func (mw *MainWindow) isPreviewableType(contentType string) bool {
-	previewableTypes := []string{
-		"text/", "image/", "application/json", "application/xml", "application/pdf",
-	}
-
-	for _, previewable := range previewableTypes {
-		if strings.HasPrefix(contentType, previewable) {
-			return true
-		}
-	}
-	return false
 }
 
 // saveAttachments allows the user to save all attachments from the current message
@@ -6314,23 +5712,6 @@ func (mw *MainWindow) openAttachment(attachment email.Attachment) {
 	}
 
 	mw.statusBar.SetText(fmt.Sprintf("Opened: %s", attachment.Filename))
-}
-
-func (mw *MainWindow) showAttachments() {
-	if mw.selectedMessage == nil {
-		dialog.ShowInformation("No Message", "Please select a message to view attachments", mw.window)
-		return
-	}
-
-	if len(mw.selectedMessage.Message.Attachments) == 0 {
-		dialog.ShowInformation("No Attachments", "The selected message has no attachments", mw.window)
-		return
-	}
-
-	// Show information that attachments are now displayed inline
-	dialog.ShowInformation("Attachments",
-		"Attachments are now displayed inline within the message. Scroll down to see attachment previews and save options.",
-		mw.window)
 }
 
 // startReadTimer starts a 5-second timer to mark the message as read
@@ -6660,45 +6041,6 @@ func (mw *MainWindow) registerKeyboardShortcuts() {
 		mw.showAddressbook()
 	})
 
-}
-
-// showKeyboardShortcuts displays a dialog with keyboard shortcuts
-func (mw *MainWindow) showKeyboardShortcuts() {
-	shortcuts := `Keyboard Shortcuts:
-
-File:
-  Ctrl+N         New Message
-  F5             Refresh All
-  Ctrl+F5        Clear Cache
-  Ctrl+Q         Exit
-
-Message:
-  Ctrl+R         Reply
-  Ctrl+Shift+R   Reply All
-  Ctrl+L         Forward
-  Delete         Move to Trash
-  Ctrl+Delete    Delete Permanently
-  Ctrl+Shift+S   Save Attachments
-  Ctrl+Shift+A   View Attachments (Inline)
-  Right-click    Context Menu
-  Shift+F10      Context Menu
-  Ctrl+M         Context Menu
-
-View:
-  Ctrl+H         Toggle HTML View
-
-Edit:
-  Ctrl+C         Copy
-  Ctrl+A         Select All Messages
-  Ctrl+F         Find in Message
-  Ctrl+Shift+F   Search Messages
-  Escape         Clear Selection
-
-Tools:
-  Ctrl+,         Settings
-  Ctrl+Shift+B   Address Book`
-
-	dialog.ShowInformation("Keyboard Shortcuts", shortcuts, mw.window)
 }
 
 // showAbout displays the about dialog

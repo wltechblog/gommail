@@ -52,8 +52,6 @@ const (
 
 	// Cache commands
 	CmdGetCachedMessages               CommandType = "get_cached_messages"
-	CmdInvalidateCache                 CommandType = "invalidate_cache"
-	CmdCleanupCache                    CommandType = "cleanup_cache"
 	CmdCleanupUnsubscribedFolderCache  CommandType = "cleanup_unsubscribed_folder_cache"
 	CmdInvalidateFolderCache           CommandType = "invalidate_folder_cache"
 	CmdInvalidateSubscribedFolderCache CommandType = "invalidate_subscribed_folder_cache"
@@ -125,25 +123,16 @@ const (
 	ParamFullHeaders    = "full_headers"
 
 	// Cache parameters
-	ParamCacheKey = "cache_key"
-	ParamForce    = "force"
 
 	// Monitoring parameters
-	ParamTimeout     = "timeout"
-	ParamIdleTimeout = "idle_timeout"
 
 	// Health check parameters
-	ParamHealthCheckInterval  = "health_check_interval"
-	ParamReconnectDelay       = "reconnect_delay"
-	ParamMaxReconnectDelay    = "max_reconnect_delay"
-	ParamMaxReconnectAttempts = "max_reconnect_attempts"
 )
 
 // Response data type keys for type safety
 const (
 	// Connection response data
 	DataConnectionState = "connection_state"
-	DataServerInfo      = "server_info"
 
 	// Folder response data
 	DataFolders       = "folders"
@@ -151,25 +140,18 @@ const (
 	DataFolderCreated = "folder_created"
 
 	// Message response data
-	DataMessages      = "messages"
-	DataMessage       = "message"
-	DataMessageUID    = "message_uid"
-	DataSearchResults = "search_results"
-	DataUIDs          = "uids"
+	DataMessages = "messages"
+	DataMessage  = "message"
 
 	// Status response data
 	DataWorkerStatus = "worker_status"
 	DataHealthStatus = "health_status"
 
 	// Monitoring response data
-	DataIdleStatus    = "idle_status"
-	DataNewMessages   = "new_messages"
-	DataFolderUpdates = "folder_updates"
+	DataIdleStatus = "idle_status"
 
 	// Cache response data
-	DataCacheCleared = "cache_cleared"
-	DataCacheStats   = "cache_stats"
-	DataFound        = "found"
+	DataFound = "found"
 )
 
 // Helper functions for creating commands

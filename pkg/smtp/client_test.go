@@ -229,45 +229,6 @@ func TestNewClientWithAuth(t *testing.T) {
 	}
 }
 
-func TestQueueMessage(t *testing.T) {
-	config := email.ServerConfig{
-		Host: "smtp.example.com",
-		Port: 587,
-	}
-
-	client := NewClient(config)
-
-	msg := &email.Message{
-		Subject: "Test Queue",
-		From: []email.Address{
-			{Email: "sender@example.com"},
-		},
-		To: []email.Address{
-			{Email: "recipient@example.com"},
-		},
-		Date: time.Now(),
-		Body: email.MessageBody{
-			Text: "Test message",
-		},
-	}
-
-	err := client.QueueMessage(msg)
-	if err != nil {
-		t.Errorf("QueueMessage failed: %v", err)
-	}
-
-	total, pending, failed := client.GetQueueStatus()
-	if total != 1 {
-		t.Errorf("Expected 1 message in queue, got %d", total)
-	}
-	if pending != 1 {
-		t.Errorf("Expected 1 pending message, got %d", pending)
-	}
-	if failed != 0 {
-		t.Errorf("Expected 0 failed messages, got %d", failed)
-	}
-}
-
 func TestValidateMessage(t *testing.T) {
 	config := email.ServerConfig{
 		Host: "smtp.example.com",

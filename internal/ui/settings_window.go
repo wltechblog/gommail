@@ -298,15 +298,12 @@ func (sw *SettingsWindow) createAccountsTab() fyne.CanvasObject {
 	removeWithTooltip := CreateTooltipButtonWithIcon("Remove Account", "Remove selected account", theme.ContentRemoveIcon(), func() {
 		sw.removeAccount()
 	})
-	testWithTooltip := CreateTooltipButtonWithIcon("Test Connection", "Test connection to selected account", theme.ConfirmIcon(), func() {
-		sw.testConnection()
-	})
 	folderManagementWithTooltip := CreateTooltipButtonWithIcon("Manage Folders", "Manage folder subscriptions for selected account", theme.FolderIcon(), func() {
 		sw.manageFolders()
 	})
 
 	// Use vertical layout for buttons to save horizontal space
-	accountButtons := container.NewVBox(addWithTooltip, removeWithTooltip, testWithTooltip, folderManagementWithTooltip)
+	accountButtons := container.NewVBox(addWithTooltip, removeWithTooltip, folderManagementWithTooltip)
 
 	// Create a more compact left panel
 	accountsHeader := widget.NewRichTextFromMarkdown("**Accounts**")
@@ -327,106 +324,6 @@ func (sw *SettingsWindow) createAccountsTab() fyne.CanvasObject {
 	leftPanel.Resize(fyne.NewSize(200, 0)) // Minimum width of 200 pixels
 
 	return hsplit
-}
-
-// createPersonalitiesSection creates the personalities management section
-func (sw *SettingsWindow) createPersonalitiesSection() fyne.CanvasObject {
-	// Create personality list
-	sw.personalityList = widget.NewList(
-		func() int {
-			if sw.selectedAccount == nil {
-				return 0
-			}
-			return len(sw.selectedAccount.Personalities)
-		},
-		func() fyne.CanvasObject {
-			return widget.NewLabel("Persona")
-		},
-		func(id widget.ListItemID, obj fyne.CanvasObject) {
-			if sw.selectedAccount == nil || id >= len(sw.selectedAccount.Personalities) {
-				return
-			}
-			personality := &sw.selectedAccount.Personalities[id]
-			label := obj.(*widget.Label)
-			defaultMarker := ""
-			if personality.IsDefault {
-				defaultMarker = " (Default)"
-			}
-			label.SetText(personality.Name + defaultMarker)
-		},
-	)
-
-	sw.personalityList.OnSelected = func(id widget.ListItemID) {
-		if sw.selectedAccount == nil || id >= len(sw.selectedAccount.Personalities) {
-			return
-		}
-		sw.selectedPersonality = &sw.selectedAccount.Personalities[id]
-		sw.loadPersonalitySettings()
-	}
-
-	// Personality form
-	personalityForm := container.NewGridWithColumns(2,
-		widget.NewLabel("Name:"), sw.personalityNameEntry,
-		widget.NewLabel("Email:"), sw.personalityEmailEntry,
-		widget.NewLabel("Display Name:"), sw.personalityDisplayEntry,
-	)
-
-	// Create a scrollable container for the signature to handle long signatures
-	signatureScroll := container.NewScroll(sw.personalitySignatureEntry)
-	signatureScroll.SetMinSize(fyne.NewSize(400, 100))
-
-	signatureContainer := container.NewVBox(
-		widget.NewLabel("Signature:"),
-		signatureScroll,
-	)
-
-	// Personality management buttons
-	addPersonalityBtn := widget.NewButtonWithIcon("Add", theme.ContentAddIcon(), func() {
-		sw.addPersonality()
-	})
-	removePersonalityBtn := widget.NewButtonWithIcon("Remove", theme.ContentRemoveIcon(), func() {
-		sw.removePersonality()
-	})
-	savePersonalityBtn := widget.NewButtonWithIcon("Save", theme.DocumentSaveIcon(), func() {
-		sw.savePersonalitySettings()
-	})
-
-	personalityButtons := container.NewHBox(addPersonalityBtn, removePersonalityBtn, savePersonalityBtn)
-
-	// Add helpful instructions
-	instructionText := widget.NewRichTextFromMarkdown("*Select a persona from the list to edit, or click **Add** to create a new one. The default persona will be automatically selected when composing new messages.*")
-	instructionText.Wrapping = fyne.TextWrapWord
-
-	personalityFormContainer := container.NewVBox(
-		instructionText,
-		widget.NewSeparator(),
-		personalityForm,
-		sw.personalityDefaultCheck,
-		signatureContainer,
-		personalityButtons,
-	)
-
-	// Create left and right panels with minimum sizes
-	sw.personalityList.Resize(fyne.NewSize(200, 150))
-	leftPanel := container.NewBorder(
-		widget.NewLabel("Personas"), nil, nil, nil,
-		sw.personalityList,
-	)
-
-	rightPanel := container.NewBorder(
-		widget.NewLabel("Persona Details"), nil, nil, nil,
-		container.NewScroll(personalityFormContainer),
-	)
-
-	// Create HSplit with better proportions
-	hsplit := container.NewHSplit(leftPanel, rightPanel)
-	hsplit.SetOffset(0.35) // Left panel gets 35%, right panel gets 65%
-
-	// Set minimum size for the entire personas section
-	personasCard := widget.NewCard("Personas", "Manage different identities for this account. Click 'Add' to create a new persona, select one from the list to edit it.", hsplit)
-	personasCard.Resize(fyne.NewSize(800, 300))
-
-	return personasCard
 }
 
 // createPersonasTab creates the dedicated personas management tab
@@ -993,21 +890,6 @@ func (sw *SettingsWindow) removeAccount() {
 				}
 			}
 		}, sw.window)
-}
-
-// testConnection tests the connection to the selected account
-func (sw *SettingsWindow) testConnection() {
-	if sw.selectedAccount == nil {
-		dialog.ShowInformation("No Selection", "Please select an account to test", sw.window)
-		return
-	}
-
-	// Save current form data to account temporarily for testing
-	sw.saveCurrentAccountSettings()
-
-	dialog.ShowInformation("Test Connection",
-		"Connection testing is not implemented yet. This would test IMAP and SMTP connections.",
-		sw.window)
 }
 
 // clearCache clears the application cache

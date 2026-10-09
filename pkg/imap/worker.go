@@ -176,16 +176,6 @@ func NewIMAPWorkerWithTracer(config *email.ServerConfig, accountName, cacheKey s
 	return worker
 }
 
-// SetTracer sets the IMAP protocol tracer for this worker
-func (w *IMAPWorker) SetTracer(tracer io.Writer) {
-	w.tracer = tracer
-	if tracer != nil {
-		w.logger.Info("IMAP protocol tracing enabled for account: %s", w.accountName)
-	} else {
-		w.logger.Info("IMAP protocol tracing disabled for account: %s", w.accountName)
-	}
-}
-
 // Start begins the worker goroutine and event loop
 func (w *IMAPWorker) Start() error {
 	// Check if already started by testing if stopCh is nil (not yet created)
@@ -2622,70 +2612,6 @@ func (w *IMAPWorker) getHealthTicker() <-chan time.Time {
 		return w.healthTicker.C
 	}
 	return nil
-}
-
-// performHealthCheck checks the connection health and initiates reconnection if needed
-func (w *IMAPWorker) performHealthCheck() {
-	w.mu.Lock()
-	w.lastHealthCheck = time.Now()
-	state := w.state
-	w.mu.Unlock()
-
-	if state == ConnectionStateReconnecting || state == ConnectionStateConnecting {
-		return
-	}
-
-	// Skip health check if not connected
-	if w.commandClient == nil {
-		return
-	}
-
-	w.logger.Debug("Performing connection health check via command channel")
-
-	// Queue health check command instead of calling client directly
-	healthCmd := NewCommand(CmdHealthCheck, map[string]interface{}{})
-	healthCmd.ResponseCh = make(chan *IMAPResponse, 1)
-
-	select {
-	case w.commandCh <- healthCmd:
-		// Wait for response
-		// Note: We don't trigger reconnection here because handleHealthCheck() already does it
-		// This prevents duplicate reconnection attempts
-		select {
-		case response := <-healthCmd.ResponseCh:
-			if !response.Success {
-				w.logger.Debug("Connection health check failed (reconnection will be handled by handleHealthCheck)")
-			} else {
-				// Connection is healthy
-				if w.state != ConnectionStateConnected {
-					w.setState(ConnectionStateConnected, nil)
-				}
-				w.logger.Debug("Connection health check passed")
-			}
-		case <-time.After(5 * time.Second):
-			w.logger.Warn("Health check command timed out (command may still be processing)")
-		}
-	default:
-		w.logger.Debug("Command channel full, skipping health check")
-	}
-}
-
-// isConnectionHealthy tests if the current IMAP connection is working
-func (w *IMAPWorker) isConnectionHealthy() bool {
-	if w.commandClient == nil {
-		return false
-	}
-
-	// Try a simple NOOP command to test the connection
-	cmd := w.commandClient.Noop()
-	err := cmd.Wait()
-	if err != nil {
-		w.logger.Debug("Connection health check failed: %v", err)
-		w.incrementErrorCount()
-		return false
-	}
-
-	return true
 }
 
 // initiateReconnection starts the reconnection process

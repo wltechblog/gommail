@@ -10,23 +10,13 @@ import (
 	"net/smtp"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/emersion/go-message"
-	"github.com/emersion/go-message/mail"
 
 	"github.com/wltechblog/gommail/internal/email"
 	"github.com/wltechblog/gommail/internal/logging"
 )
-
-// QueuedMessage represents a message in the send queue
-type QueuedMessage struct {
-	Message   *email.Message
-	Attempts  int
-	NextRetry time.Time
-	Error     error
-}
 
 // AuthMethod represents different authentication methods
 type AuthMethod int
@@ -40,10 +30,6 @@ const (
 type Client struct {
 	config     email.ServerConfig
 	authMethod AuthMethod
-	queue      []*QueuedMessage
-	queueMutex sync.RWMutex
-	maxRetries int
-	retryDelay time.Duration
 
 	logger *logging.Logger
 }
@@ -53,9 +39,6 @@ func NewClient(config email.ServerConfig) *Client {
 	return &Client{
 		config:     config,
 		authMethod: AuthPlain, // Default to PLAIN auth
-		queue:      make([]*QueuedMessage, 0),
-		maxRetries: 3,
-		retryDelay: time.Minute * 5,
 		logger:     logging.NewComponent("smtp"),
 	}
 }
@@ -293,24 +276,6 @@ func (c *Client) formatAddresses(addresses []email.Address) string {
 	return strings.Join(formatted, ", ")
 }
 
-// generateBoundary generates a boundary string for multipart messages
-func (c *Client) generateBoundary() string {
-	return fmt.Sprintf("boundary_%d", time.Now().UnixNano())
-}
-
-// convertToMailAddresses converts our email.Address to mail.Address
-func (c *Client) convertToMailAddresses(addresses []email.Address) []*mail.Address {
-	var result []*mail.Address
-	for _, addr := range addresses {
-		mailAddr := &mail.Address{
-			Name:    addr.Name,
-			Address: addr.Email,
-		}
-		result = append(result, mailAddr)
-	}
-	return result
-}
-
 // writeMultipartWithAttachments writes a multipart/mixed message with attachments
 func (c *Client) writeMultipartWithAttachments(mw *message.Writer, msg *email.Message) error {
 	// The message writer should already be set up for multipart/mixed
@@ -481,143 +446,6 @@ func (c *Client) createLoginAuth() smtp.Auth {
 	// LOGIN auth is not directly supported by net/smtp, but we can implement it
 	// For now, fall back to PLAIN auth as it's widely supported
 	return smtp.PlainAuth("", c.config.Username, c.config.Password, c.config.Host)
-}
-
-// QueueMessage adds a message to the send queue for later delivery
-func (c *Client) QueueMessage(msg *email.Message) error {
-	c.queueMutex.Lock()
-	defer c.queueMutex.Unlock()
-
-	c.logger.Debug("Queuing message for later delivery: %s", msg.Subject)
-
-	queuedMsg := &QueuedMessage{
-		Message:   msg,
-		Attempts:  0,
-		NextRetry: time.Now(),
-	}
-
-	c.queue = append(c.queue, queuedMsg)
-	c.logger.Info("Message queued successfully: %s (queue size: %d)", msg.Subject, len(c.queue))
-	return nil
-}
-
-// ProcessQueue attempts to send all queued messages
-func (c *Client) ProcessQueue() error {
-	c.queueMutex.Lock()
-	defer c.queueMutex.Unlock()
-
-	if len(c.queue) == 0 {
-		c.logger.Debug("Queue is empty, nothing to process")
-		return nil
-	}
-
-	c.logger.Info("Processing queue with %d messages", len(c.queue))
-
-	var remainingQueue []*QueuedMessage
-	var lastError error
-	processed := 0
-	sent := 0
-	failed := 0
-	dropped := 0
-
-	for _, queuedMsg := range c.queue {
-		if time.Now().Before(queuedMsg.NextRetry) {
-			c.logger.Debug("Message '%s' not ready for retry (next retry: %v)",
-				queuedMsg.Message.Subject, queuedMsg.NextRetry)
-			remainingQueue = append(remainingQueue, queuedMsg)
-			continue
-		}
-
-		processed++
-		c.logger.Debug("Processing queued message '%s' (attempt %d/%d)",
-			queuedMsg.Message.Subject, queuedMsg.Attempts+1, c.maxRetries)
-
-		err := c.SendMessage(queuedMsg.Message)
-		if err != nil {
-			queuedMsg.Attempts++
-			queuedMsg.Error = err
-			lastError = err
-			failed++
-
-			if queuedMsg.Attempts < c.maxRetries {
-				// Schedule retry with exponential backoff
-				backoff := c.retryDelay * time.Duration(queuedMsg.Attempts)
-				queuedMsg.NextRetry = time.Now().Add(backoff)
-				remainingQueue = append(remainingQueue, queuedMsg)
-				c.logger.Warn("Message '%s' failed (attempt %d/%d), scheduling retry in %v: %v",
-					queuedMsg.Message.Subject, queuedMsg.Attempts, c.maxRetries, backoff, err)
-			} else {
-				dropped++
-				c.logger.Error("Message '%s' dropped after %d failed attempts: %v",
-					queuedMsg.Message.Subject, queuedMsg.Attempts, err)
-			}
-		} else {
-			sent++
-			c.logger.Debug("Successfully sent queued message: %s", queuedMsg.Message.Subject)
-		}
-		// If successful, message is not added back to queue
-	}
-
-	c.queue = remainingQueue
-	c.logger.Info("Queue processing complete: processed=%d, sent=%d, failed=%d, dropped=%d, remaining=%d",
-		processed, sent, failed, dropped, len(remainingQueue))
-	return lastError
-}
-
-// GetQueueStatus returns information about the current queue
-func (c *Client) GetQueueStatus() (total int, pending int, failed int) {
-	c.queueMutex.RLock()
-	defer c.queueMutex.RUnlock()
-
-	total = len(c.queue)
-	for _, msg := range c.queue {
-		if msg.Error != nil {
-			failed++
-		} else {
-			pending++
-		}
-	}
-	return
-}
-
-// ClearQueue removes all messages from the queue
-func (c *Client) ClearQueue() {
-	c.queueMutex.Lock()
-	defer c.queueMutex.Unlock()
-	c.queue = c.queue[:0]
-}
-
-// SendMessageWithDSN sends a message with delivery status notification options
-func (c *Client) SendMessageWithDSN(msg *email.Message, dsnOptions string) error {
-	// Add DSN headers to the message
-	if msg.Headers == nil {
-		msg.Headers = make(map[string]string)
-	}
-
-	// Add Return-Receipt-To header for read receipts
-	if len(msg.From) > 0 {
-		msg.Headers["Return-Receipt-To"] = msg.From[0].Email
-	}
-
-	// Add DSN options if specified
-	if dsnOptions != "" {
-		msg.Headers["Delivery-Status-Notification"] = dsnOptions
-	}
-
-	return c.SendMessage(msg)
-}
-
-// SendMessageAsync sends a message asynchronously by adding it to the queue
-func (c *Client) SendMessageAsync(msg *email.Message) error {
-	return c.QueueMessage(msg)
-}
-
-// SetRetryPolicy configures the retry policy for queued messages
-func (c *Client) SetRetryPolicy(maxRetries int, retryDelay time.Duration) {
-	c.queueMutex.Lock()
-	defer c.queueMutex.Unlock()
-	c.maxRetries = maxRetries
-	c.retryDelay = retryDelay
 }
 
 // ValidateMessage performs basic validation on a message before sending

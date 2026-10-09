@@ -69,7 +69,7 @@ func (p *MessageProcessor) ParseRawMessage(rawMessage []byte) (*Message, error) 
 	}
 
 	// Parse body and attachments
-	err = p.parseBody(msg.Body, msg.Header, emailMsg)
+	err = p.parseBodyWithEncoding(msg.Body, msg.Header, emailMsg)
 	if err != nil {
 		// Save the failed message for debugging
 		p.saveFailedMessage(rawMessage, err)
@@ -77,27 +77,6 @@ func (p *MessageProcessor) ParseRawMessage(rawMessage []byte) (*Message, error) 
 	}
 
 	return emailMsg, nil
-}
-
-// ParseRawMessageWithAttachments parses a message and processes attachments if attachment manager is available
-func (p *MessageProcessor) ParseRawMessageWithAttachments(rawMessage []byte) (*Message, []AttachmentInfo, error) {
-	// Parse the message first
-	msg, err := p.ParseRawMessage(rawMessage)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// Process attachments if manager is available
-	var attachmentInfos []AttachmentInfo
-	if p.AttachmentManager != nil && len(msg.Attachments) > 0 {
-		attachmentInfos, err = p.AttachmentManager.ProcessMessageAttachments(msg)
-		if err != nil {
-			// Log error but don't fail the entire parsing
-			// In a real implementation, you'd use a proper logger
-		}
-	}
-
-	return msg, attachmentInfos, nil
 }
 
 // parseHeaders extracts headers from the mail message
@@ -170,12 +149,6 @@ func (p *MessageProcessor) parseAddresses(addressStr string) ([]Address, error) 
 	return result, nil
 }
 
-// parseBody parses the message body and extracts text, HTML, and attachments
-func (p *MessageProcessor) parseBody(body io.Reader, header mail.Header, msg *Message) error {
-	// Use parseBodyWithEncoding to handle Content-Transfer-Encoding properly
-	return p.parseBodyWithEncoding(body, header, msg)
-}
-
 // parseBodyWithEncoding parses message body with Content-Transfer-Encoding support
 func (p *MessageProcessor) parseBodyWithEncoding(body io.Reader, header mail.Header, msg *Message) error {
 	// Get content type and transfer encoding
@@ -201,7 +174,7 @@ func (p *MessageProcessor) parseBodyWithEncoding(body io.Reader, header mail.Hea
 		return p.parseMultipart(decodedReader, mediaType, params, msg)
 	default:
 		// Treat as attachment
-		return p.parseAttachment(decodedReader, mediaType, "unknown", msg)
+		return p.parseAttachmentWithEncoding(decodedReader, mediaType, "", "unknown", msg)
 	}
 }
 
@@ -229,11 +202,6 @@ func (p *MessageProcessor) parseTextPartWithDecoding(body io.Reader, mediaType s
 	}
 
 	return nil
-}
-
-// parseTextPart parses a text or HTML part (legacy function for backward compatibility)
-func (p *MessageProcessor) parseTextPart(body io.Reader, mediaType string, msg *Message) error {
-	return p.parseTextPartWithDecoding(body, mediaType, msg)
 }
 
 // parseMultipart parses multipart messages
@@ -319,11 +287,6 @@ func (p *MessageProcessor) parseAttachmentWithEncoding(body io.Reader, contentTy
 
 	msg.Attachments = append(msg.Attachments, attachment)
 	return nil
-}
-
-// parseAttachment parses an attachment (legacy function for backward compatibility)
-func (p *MessageProcessor) parseAttachment(body io.Reader, contentType, filename string, msg *Message) error {
-	return p.parseAttachmentWithEncoding(body, contentType, "", filename, msg)
 }
 
 // getDecodedReader returns a reader that decodes content based on transfer encoding

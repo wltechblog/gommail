@@ -344,24 +344,6 @@ func (sw *SearchWindow) updateResultItem(id widget.ListItemID, obj fyne.CanvasOb
 	dateLabel.SetText(msg.Date.Format("Jan 2, 15:04"))
 }
 
-// formatAddresses formats a slice of addresses for display
-func (sw *SearchWindow) formatAddresses(addresses []email.Address) string {
-	if len(addresses) == 0 {
-		return ""
-	}
-
-	var formatted []string
-	for _, addr := range addresses {
-		if addr.Name != "" {
-			formatted = append(formatted, fmt.Sprintf("%s <%s>", addr.Name, addr.Email))
-		} else {
-			formatted = append(formatted, addr.Email)
-		}
-	}
-
-	return strings.Join(formatted, ", ")
-}
-
 // parseDate parses a date string in YYYY-MM-DD format
 func (sw *SearchWindow) parseDate(dateStr string) *time.Time {
 	if strings.TrimSpace(dateStr) == "" {

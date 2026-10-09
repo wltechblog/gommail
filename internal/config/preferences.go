@@ -80,21 +80,6 @@ func (pc *PreferencesConfig) Save() error {
 		return err
 	}
 
-	// Save UI configuration
-	pc.saveUIConfig()
-
-	// Save cache configuration
-	pc.saveCacheConfig()
-
-	// Save logging configuration
-	pc.saveLoggingConfig()
-
-	// Save tracing configuration
-	pc.saveTracingConfig()
-
-	// Save addressbook configuration
-	pc.saveAddressbookConfig()
-
 	// Mark preferences as initialized and set version
 	pc.prefs.SetBool("config.initialized", true)
 	pc.prefs.SetString("config.version", "1.0")
@@ -257,36 +242,6 @@ func (pc *PreferencesConfig) saveAccounts() error {
 	pc.prefs.SetString("accounts.data", string(accountsJSON))
 	pc.prefs.SetInt("accounts.count", len(pc.accounts))
 	return nil
-}
-
-// saveUIConfig saves UI configuration to preferences
-func (pc *PreferencesConfig) saveUIConfig() {
-	ui := pc.GetUI()
-	pc.SetUI(ui)
-}
-
-// saveCacheConfig saves cache configuration to preferences
-func (pc *PreferencesConfig) saveCacheConfig() {
-	cache := pc.GetCache()
-	pc.SetCache(cache)
-}
-
-// saveLoggingConfig saves logging configuration to preferences
-func (pc *PreferencesConfig) saveLoggingConfig() {
-	logging := pc.GetLogging()
-	pc.SetLogging(logging)
-}
-
-// saveTracingConfig saves tracing configuration to preferences
-func (pc *PreferencesConfig) saveTracingConfig() {
-	tracing := pc.GetTracing()
-	pc.SetTracing(tracing)
-}
-
-// saveAddressbookConfig saves addressbook configuration to preferences
-func (pc *PreferencesConfig) saveAddressbookConfig() {
-	addressbook := pc.GetAddressbook()
-	pc.SetAddressbook(addressbook)
 }
 
 // UpdateServerValidation updates server validation information

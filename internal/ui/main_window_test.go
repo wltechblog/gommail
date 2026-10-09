@@ -1117,55 +1117,6 @@ func TestSetupNewAccountAutomatically(t *testing.T) {
 	t.Log("Automatic account setup test completed successfully")
 }
 
-func TestHTMLToMarkdownConversion(t *testing.T) {
-	// Create a minimal MainWindow for testing
-	mw := &MainWindow{}
-
-	// Test HTML with links
-	html := `<html><body>
-<p>PRE ORDER NOW.</p>
-<p><a href="https://tbrdy4.fm72.fdske.com/e/c/01k5cpe2dv22wfqq4pjkbfrg7p/01k5cpe2dv22wfqq4pjnqm9mep">Link 1</a></p>
-<p><a href="https://tbrdy4.fm72.fdske.com/e/c/01k5cpe2dv22wfqq4pjkbfrg7p/01k5cpe2dv22wfqq4pjsm7m6c0">Link 2</a></p>
-</body></html>`
-
-	markdown := mw.TestHTMLToMarkdown(html)
-	t.Logf("Converted markdown: %s", markdown)
-
-	// Check if links are properly converted
-	if !strings.Contains(markdown, "[Link 1](https://") {
-		t.Errorf("Link 1 not properly converted to markdown: %s", markdown)
-	}
-
-	if !strings.Contains(markdown, "[Link 2](https://") {
-		t.Errorf("Link 2 not properly converted to markdown: %s", markdown)
-	}
-
-	// Check if PRE ORDER NOW text is preserved
-	if !strings.Contains(markdown, "PRE ORDER NOW") {
-		t.Errorf("Text content not preserved: %s", markdown)
-	}
-}
-
-func TestHTMLToMarkdownWithPlainTextURLs(t *testing.T) {
-	// Create a minimal MainWindow for testing
-	mw := &MainWindow{}
-
-	// Test HTML with plain text URLs (not wrapped in <a> tags)
-	html := `<html><body>
-<p>PRE ORDER NOW.</p>
-<p>https://tbrdy4.fm72.fdske.com/e/c/01k5cpe2dv22wfqq4pjkbfrg7p/01k5cpe2dv22wfqq4pjnqm9mep</p>
-<p>https://tbrdy4.fm72.fdske.com/e/c/01k5cpe2dv22wfqq4pjkbfrg7p/01k5cpe2dv22wfqq4pjsm7m6c0</p>
-</body></html>`
-
-	markdown := mw.TestHTMLToMarkdown(html)
-	t.Logf("Converted markdown: %s", markdown)
-
-	// The URLs should still be present as plain text since they're not in <a> tags
-	if !strings.Contains(markdown, "https://tbrdy4.fm72.fdske.com") {
-		t.Errorf("Plain text URLs not preserved: %s", markdown)
-	}
-}
-
 func TestFormatAddresses(t *testing.T) {
 	mw := &MainWindow{}
 

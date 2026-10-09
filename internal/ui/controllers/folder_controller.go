@@ -8,7 +8,6 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
-	"github.com/wltechblog/gommail/internal/config"
 	"github.com/wltechblog/gommail/internal/email"
 	"github.com/wltechblog/gommail/internal/logging"
 	"github.com/wltechblog/gommail/pkg/imap"
@@ -298,19 +297,6 @@ func (fc *FolderControllerImpl) HandleDeletedFolder(deletedFolder string) {
 // GetFolderList returns the folder list widget.
 func (fc *FolderControllerImpl) GetFolderList() *widget.List {
 	return fc.folderList
-}
-
-// ShowFolderSubscriptions shows the folder subscription dialog.
-// This is a placeholder - the actual implementation will be in MainWindow
-// since it requires access to RefreshCoordinator and other components.
-func (fc *FolderControllerImpl) ShowFolderSubscriptions() {
-	fc.logger.Debug("ShowFolderSubscriptions called - should be implemented by MainWindow")
-}
-
-// ShowFolderSubscriptionsForAccount shows folder subscriptions for a specific account.
-// This is a placeholder - the actual implementation will be in MainWindow.
-func (fc *FolderControllerImpl) ShowFolderSubscriptionsForAccount(account *config.Account) {
-	fc.logger.Debug("ShowFolderSubscriptionsForAccount called for account: %s", account.Name)
 }
 
 // GetFolderNames returns a list of folder names (excluding the current folder if specified).

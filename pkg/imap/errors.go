@@ -26,12 +26,3 @@ func wrapResponseError(commandName string, response *IMAPResponse) error {
 	return nil
 }
 
-// wrapTimeoutError creates an error for command timeout
-func wrapTimeoutError(commandName string) error {
-	return fmt.Errorf("%s command timed out", commandName)
-}
-
-// wrapValidationError creates an error for invalid parameters
-func wrapValidationError(commandName string, reason string) error {
-	return fmt.Errorf("%s command failed: %s", commandName, reason)
-}

@@ -6,7 +6,6 @@ import (
 	"sync"
 
 	"github.com/wltechblog/gommail/internal/config"
-	"github.com/wltechblog/gommail/internal/email"
 	"github.com/wltechblog/gommail/internal/logging"
 	"github.com/wltechblog/gommail/pkg/cache"
 	"github.com/wltechblog/gommail/pkg/imap"
@@ -79,23 +78,6 @@ func (ac *AccountControllerImpl) SetUnifiedInbox(enabled bool) {
 	defer ac.stateMu.Unlock()
 	ac.isUnifiedInbox = enabled
 	ac.logger.Debug("Unified inbox mode set to: %v", enabled)
-}
-
-// GetOrCreateIMAPClient gets or creates an IMAP client for the specified account
-// using a default factory that creates a basic (non-traced, unconnected) client.
-func (ac *AccountControllerImpl) GetOrCreateIMAPClient(account *config.Account) (*imap.ClientWrapper, error) {
-	return ac.GetOrCreateIMAPClientWithFactory(account, func(acc *config.Account) (*imap.ClientWrapper, error) {
-		serverConfig := email.ServerConfig{
-			Host:     acc.IMAP.Host,
-			Port:     acc.IMAP.Port,
-			Username: acc.IMAP.Username,
-			Password: acc.IMAP.Password,
-			TLS:      acc.IMAP.TLS,
-		}
-		accountKey := fmt.Sprintf("account_%s", acc.Name)
-		client := imap.NewClientWrapperWithCache(serverConfig, ac.cache, accountKey)
-		return client, nil
-	})
 }
 
 // GetOrCreateIMAPClientWithFactory atomically gets an existing connected client
@@ -267,14 +249,4 @@ func (ac *AccountControllerImpl) InvalidateUnifiedInboxCache() {
 	}
 
 	ac.logger.Info("Unified inbox cache invalidated for all accounts")
-}
-
-// CacheAccountMessages caches messages for a specific account
-func (ac *AccountControllerImpl) CacheAccountMessages(accountName string, messages []email.Message) {
-	if ac.cache == nil {
-		return
-	}
-
-	// Implementation will be added when integrating with MainWindow
-	ac.logger.Debug("Caching %d messages for account: %s", len(messages), accountName)
 }

@@ -320,14 +320,6 @@ func (c *Cache) decompress(data []byte) ([]byte, error) {
 	return io.ReadAll(reader)
 }
 
-// ListKeys returns all cache keys that match the given prefix
-func (c *Cache) ListKeys(prefix string) ([]string, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	return c.listKeysLocked(prefix)
-}
-
 // listKeysLocked returns all cache keys that match the given prefix. Caller must hold c.mu.
 func (c *Cache) listKeysLocked(prefix string) ([]string, error) {
 	c.logger.Debug("Listing cache keys with prefix: %s", prefix)
@@ -365,39 +357,6 @@ func (c *Cache) listKeysLocked(prefix string) ([]string, error) {
 
 	c.logger.Debug("Found %d cache keys with prefix '%s'", len(keys), prefix)
 	return keys, nil
-}
-
-// DeleteByPrefix removes all cache entries that match the given prefix
-func (c *Cache) DeleteByPrefix(prefix string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.logger.Debug("Deleting cache entries with prefix: %s", prefix)
-
-	keys, err := c.listKeysLocked(prefix)
-	if err != nil {
-		return err
-	}
-
-	var deletedCount int
-	var errors []error
-
-	for _, key := range keys {
-		if err := c.deleteLocked(key); err != nil {
-			c.logger.Error("Failed to delete cache entry %s: %v", key, err)
-			errors = append(errors, err)
-		} else {
-			deletedCount++
-		}
-	}
-
-	c.logger.Debug("Deleted %d cache entries with prefix '%s'", deletedCount, prefix)
-
-	if len(errors) > 0 {
-		return fmt.Errorf("failed to delete %d cache entries: %v", len(errors), errors)
-	}
-
-	return nil
 }
 
 // getFilename generates a filename for a cache key
