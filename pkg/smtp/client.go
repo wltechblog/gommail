@@ -174,7 +174,13 @@ func (c *Client) sendWithTLS(addr string, auth smtp.Auth, from string, to []stri
 		return fmt.Errorf("TLS handshake failed: %w", err)
 	}
 	defer conn.Close()
-	return c.sendOnConn(conn, auth, from, to, msg)
+
+	client, err := smtp.NewClient(conn, c.config.Host)
+	if err != nil {
+		return fmt.Errorf("failed to create SMTP client: %w", err)
+	}
+	defer client.Quit()
+	return c.mailExchange(client, auth, from, to, msg)
 }
 
 // sendWithSTARTTLS sends email over a plain connection upgraded with STARTTLS.
@@ -187,6 +193,10 @@ func (c *Client) sendWithSTARTTLS(addr string, auth smtp.Auth, from string, to [
 	}
 	defer conn.Close()
 
+	// smtp.NewClient consumes the server greeting, so exactly one client may
+	// exist per connection: upgrade THIS client and run the mail exchange on
+	// it. (Creating a second client later deadlocked the send: both sides
+	// waited for the other to speak.)
 	client, err := smtp.NewClient(conn, c.config.Host)
 	if err != nil {
 		return fmt.Errorf("failed to create SMTP client: %w", err)
@@ -198,18 +208,12 @@ func (c *Client) sendWithSTARTTLS(addr string, auth smtp.Auth, from string, to [
 			return fmt.Errorf("STARTTLS failed: %w", err)
 		}
 	}
-	return c.sendOnConn(conn, auth, from, to, msg)
+	return c.mailExchange(client, auth, from, to, msg)
 }
 
-// sendOnConn performs the authenticated MAIL/RCPT/DATA exchange on an
-// established connection.
-func (c *Client) sendOnConn(conn net.Conn, auth smtp.Auth, from string, to []string, msg []byte) error {
-	client, err := smtp.NewClient(conn, c.config.Host)
-	if err != nil {
-		return fmt.Errorf("failed to create SMTP client: %w", err)
-	}
-	defer client.Quit()
-
+// mailExchange performs the authenticated MAIL/RCPT/DATA exchange on an
+// established, greeting-consumed smtp.Client.
+func (c *Client) mailExchange(client *smtp.Client, auth smtp.Auth, from string, to []string, msg []byte) error {
 	// Authenticate if credentials provided
 	if auth != nil {
 		if err := client.Auth(auth); err != nil {

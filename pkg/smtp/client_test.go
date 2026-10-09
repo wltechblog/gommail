@@ -1,8 +1,10 @@
 package smtp
 
 import (
+	"bufio"
 	"bytes"
 	"io"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -428,4 +430,151 @@ func TestBuildMessageHeadersDateAndMessageID(t *testing.T) {
 		t.Error("explicit Message-ID header not preserved")
 	}
 
+}
+
+// fakeSMTPServer speaks just enough SMTP for one send: greeting, EHLO, AUTH
+// (accepted blindly), MAIL, RCPT, DATA and QUIT. STARTTLS is deliberately
+// NOT advertised so the STARTTLS code path runs without a TLS handshake.
+type fakeSMTPServer struct {
+	t          *testing.T
+	listener   net.Listener
+	sawMail    chan string
+	sawRcpt    chan string
+	sawDataEnd chan []byte
+}
+
+func newFakeSMTPServer(t *testing.T) *fakeSMTPServer {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	s := &fakeSMTPServer{
+		t:          t,
+		listener:   l,
+		sawMail:    make(chan string, 1),
+		sawRcpt:    make(chan string, 1),
+		sawDataEnd: make(chan []byte, 1),
+	}
+	go s.serve()
+	t.Cleanup(func() { l.Close() })
+	return s
+}
+
+func (s *fakeSMTPServer) addr() string { return s.listener.Addr().String() }
+
+func (s *fakeSMTPServer) serve() {
+	conn, err := s.listener.Accept()
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	w := bufio.NewWriter(conn)
+	r := bufio.NewReader(conn)
+	line := func(str string) { w.WriteString(str + "\r\n"); w.Flush() }
+	line("220 fake.example ESMTP")
+
+	inData := false
+	var data bytes.Buffer
+	for {
+		cmd, err := r.ReadString('\n')
+		if err != nil {
+			return
+		}
+		cmd = strings.TrimRight(cmd, "\r\n")
+		upper := strings.ToUpper(cmd)
+		switch {
+		case inData:
+			if cmd == "." {
+				inData = false
+				s.sawDataEnd <- data.Bytes()
+				line("250 OK message accepted")
+			} else {
+				data.WriteString(cmd + "\r\n")
+			}
+		case strings.HasPrefix(upper, "EHLO"), strings.HasPrefix(upper, "HELO"):
+			// No STARTTLS advertised on purpose (see type comment).
+			line("250-fake.example")
+			line("250-AUTH PLAIN LOGIN")
+			line("250 SIZE 35882577")
+		case strings.HasPrefix(upper, "AUTH"):
+			line("235 2.7.0 Authentication successful")
+		case strings.HasPrefix(upper, "MAIL FROM:"):
+			s.sawMail <- cmd
+			line("250 2.1.0 OK")
+		case strings.HasPrefix(upper, "RCPT TO:"):
+			s.sawRcpt <- cmd
+			line("250 2.1.5 OK")
+		case upper == "DATA":
+			inData = true
+			data.Reset()
+			line("354 Go ahead")
+		case upper == "QUIT":
+			line("221 2.0.0 closing")
+			return
+		default:
+			line("250 OK")
+		}
+	}
+}
+
+// TestSendMessageSTARTTLSPathCompletes guards against the double-greeting
+// deadlock: sendWithSTARTTLS used to build a second smtp.Client on the same
+// connection, whose greeting read blocked forever while the server waited
+// for a command. With the fake server not advertising STARTTLS, the send
+// exercises exactly the previously-deadlocked sequence and must complete.
+func TestSendMessageSTARTTLSPathCompletes(t *testing.T) {
+	srv := newFakeSMTPServer(t)
+
+	c := NewClient(email.ServerConfig{
+		Host: "127.0.0.1", Port: srv.listener.Addr().(*net.TCPAddr).Port,
+		Username: "user@example.com", Password: "pass", TLS: false,
+	})
+
+	msg := &email.Message{
+		Subject: "fake server probe",
+		From:    []email.Address{{Email: "user@example.com"}},
+		To:      []email.Address{{Email: "rcpt@example.com"}},
+		Body:    email.MessageBody{Text: "hello"},
+		Attachments: []email.Attachment{{
+			Filename: "file.bin", ContentType: "application/octet-stream", Data: []byte("attachment-bytes"),
+		}},
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- c.SendMessage(msg) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("SendMessage failed: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("SendMessage did not complete - send path is deadlocked")
+	}
+
+	select {
+	case mail := <-srv.sawMail:
+		if !strings.Contains(mail, "user@example.com") {
+			t.Errorf("unexpected MAIL FROM: %s", mail)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("server never saw MAIL FROM")
+	}
+	select {
+	case rcpt := <-srv.sawRcpt:
+		if !strings.Contains(rcpt, "rcpt@example.com") {
+			t.Errorf("unexpected RCPT TO: %s", rcpt)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("server never saw RCPT TO")
+	}
+	select {
+	case body := <-srv.sawDataEnd:
+		if !strings.Contains(string(body), "Subject: fake server probe") {
+			t.Error("message body missing subject")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("server never saw the message data")
+	}
 }
