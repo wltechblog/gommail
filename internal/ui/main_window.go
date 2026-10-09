@@ -217,7 +217,7 @@ type MainWindow struct {
 	// Fresh fetch state
 	// freshFetchMu guards freshFetchInProgress, which is touched by
 	// concurrent folder-load goroutines.
-	freshFetchMu        sync.Mutex
+	freshFetchMu         sync.Mutex
 	freshFetchInProgress bool
 
 	// Read timer state
@@ -1929,15 +1929,7 @@ func (mw *MainWindow) refreshSingleAccountInUnifiedInbox(accountName string) {
 	mw.logger.Info("Refreshing single account %s in unified inbox", accountName)
 
 	// Find the account config
-	accounts := mw.config.GetAccounts()
-	var targetAccount *config.Account
-	for i := range accounts {
-		if accounts[i].Name == accountName {
-			targetAccount = &accounts[i]
-			break
-		}
-	}
-
+	targetAccount := mw.getAccountByName(accountName)
 	if targetAccount == nil {
 		mw.logger.Error("Account %s not found in config", accountName)
 		return
@@ -2024,14 +2016,7 @@ func (mw *MainWindow) injectNewMessagesIntoUnifiedInboxForAccount(accountName, f
 	mw.logger.Info("Injecting %d new messages for account %s (folder %s) into unified inbox", len(messages), accountName, folder)
 
 	// Find the account config
-	accounts := mw.config.GetAccounts()
-	var targetAccount *config.Account
-	for i := range accounts {
-		if accounts[i].Name == accountName {
-			targetAccount = &accounts[i]
-			break
-		}
-	}
+	targetAccount := mw.getAccountByName(accountName)
 	if targetAccount == nil {
 		mw.logger.Error("injectNewMessagesIntoUnifiedInboxForAccount: account %s not found in config", accountName)
 		return
@@ -2367,19 +2352,9 @@ func (mw *MainWindow) getAccountForMessage(msg *email.Message) (*config.Account,
 	}
 
 	// Find the account by name
-	accounts := mw.config.GetAccounts()
-	for i, account := range accounts {
-		if account.Name == accountName {
-			// Create SMTP client for this account if needed
-			smtpClient := smtp.NewClient(email.ServerConfig{
-				Host:     account.SMTP.Host,
-				Port:     account.SMTP.Port,
-				Username: account.SMTP.Username,
-				Password: account.SMTP.Password,
-				TLS:      account.SMTP.TLS,
-			})
-			return &accounts[i], smtpClient, nil
-		}
+	account := mw.getAccountByName(accountName)
+	if account != nil {
+		return account, mw.smtpClientForAccount(account), nil
 	}
 
 	return nil, nil, fmt.Errorf("account %s not found", accountName)
@@ -3033,13 +3008,7 @@ func (mw *MainWindow) performSingleMoveToTrash(msg *email.MessageIndexItem) erro
 
 	if mw.accountController.IsUnifiedInbox() {
 		// Find the account for this message
-		accounts := mw.config.GetAccounts()
-		for _, acc := range accounts {
-			if acc.Name == msg.AccountName {
-				currentAccount = &acc
-				break
-			}
-		}
+		currentAccount = mw.getAccountByName(msg.AccountName)
 		if currentAccount == nil {
 			return fmt.Errorf("account not found: %s", msg.AccountName)
 		}
@@ -3630,6 +3599,67 @@ func (mw *MainWindow) getAccountByName(accountName string) *config.Account {
 	return nil
 }
 
+// composeReplyOrForward opens a compose window in one of three modes.
+func (mw *MainWindow) composeReplyOrForward(mode string) {
+	if mw.selectedMessage == nil {
+		var action string
+		switch mode {
+		case "reply", "replyAll":
+			action = "reply to"
+		default:
+			action = "forward"
+		}
+		dialog.ShowInformation("No Message", "Please select a message to "+action, mw.window)
+		return
+	}
+
+	account := mw.getAccountByName(mw.selectedMessage.AccountName)
+	if account == nil {
+		dialog.ShowError(fmt.Errorf("Cannot %s: account %s not found", mode, mw.selectedMessage.AccountName), mw.window)
+		return
+	}
+
+	opts := ComposeOptions{
+		Account:        account,
+		SMTPClient:     mw.smtpClientForAccount(account),
+		IMAPClient:     mw.imapClientForAccount(account),
+		AddressbookMgr: mw.addressbookMgr,
+		OnSent: func() {
+			mw.refreshSentFolderAfterSend(account)
+			fyne.Do(func() {
+				if mode == "forward" {
+					mw.statusBar.SetText("Message forwarded successfully")
+				} else {
+					mw.statusBar.SetText("Reply sent successfully")
+				}
+			})
+		},
+		OnClosed: func() {
+			if mode == "forward" {
+				mw.statusBar.SetText("Forward window closed")
+			} else {
+				mw.statusBar.SetText("Reply window closed")
+			}
+		},
+	}
+	switch mode {
+	case "reply":
+		opts.ReplyTo = &mw.selectedMessage.Message
+	case "replyAll":
+		opts.ReplyTo = &mw.selectedMessage.Message
+		opts.ReplyAll = true
+	default:
+		opts.Forward = &mw.selectedMessage.Message
+	}
+
+	composeWindow := NewComposeWindow(mw.app, mw.configManagerToConfig(), opts)
+	composeWindow.Show()
+}
+
+func (mw *MainWindow) replyToMessage()    { mw.composeReplyOrForward("reply") }
+func (mw *MainWindow) replyAllToMessage() { mw.composeReplyOrForward("replyAll") }
+func (mw *MainWindow) forwardMessage()    { mw.composeReplyOrForward("forward") }
+
 func (mw *MainWindow) composeMessage() {
 	if mw.accountController.GetCurrentAccount() == nil {
 		// In unified inbox mode — let the user pick which account/persona to send from
@@ -3808,109 +3838,6 @@ func (mw *MainWindow) smtpClientForAccount(account *config.Account) *smtp.Client
 	})
 }
 
-func (mw *MainWindow) replyToMessage() {
-	if mw.selectedMessage == nil {
-		dialog.ShowInformation("No Message", "Please select a message to reply to", mw.window)
-		return
-	}
-
-	// Get account from config using the account name from MessageIndexItem
-	account := mw.getAccountByName(mw.selectedMessage.AccountName)
-	if account == nil {
-		dialog.ShowError(fmt.Errorf("Cannot reply: account %s not found", mw.selectedMessage.AccountName), mw.window)
-		return
-	}
-
-	opts := ComposeOptions{
-		Account:        account,
-		SMTPClient:     mw.smtpClientForAccount(account),
-		IMAPClient:     mw.imapClientForAccount(account),
-		AddressbookMgr: mw.addressbookMgr,
-		ReplyTo:        &mw.selectedMessage.Message,
-		OnSent: func() {
-			mw.refreshSentFolderAfterSend(account)
-			fyne.Do(func() {
-				mw.statusBar.SetText("Reply sent successfully")
-			})
-		},
-		OnClosed: func() {
-			mw.statusBar.SetText("Reply window closed")
-		},
-	}
-
-	composeWindow := NewComposeWindow(mw.app, mw.configManagerToConfig(), opts)
-	composeWindow.Show()
-}
-
-func (mw *MainWindow) replyAllToMessage() {
-	if mw.selectedMessage == nil {
-		dialog.ShowInformation("No Message", "Please select a message to reply to", mw.window)
-		return
-	}
-
-	// Get account from config using the account name from MessageIndexItem
-	account := mw.getAccountByName(mw.selectedMessage.AccountName)
-	if account == nil {
-		dialog.ShowError(fmt.Errorf("Cannot reply all: account %s not found", mw.selectedMessage.AccountName), mw.window)
-		return
-	}
-
-	opts := ComposeOptions{
-		Account:        account,
-		SMTPClient:     mw.smtpClientForAccount(account),
-		IMAPClient:     mw.imapClientForAccount(account),
-		AddressbookMgr: mw.addressbookMgr,
-		ReplyTo:        &mw.selectedMessage.Message,
-		ReplyAll:       true, // This is the key difference from regular reply
-		OnSent: func() {
-			mw.refreshSentFolderAfterSend(account)
-			fyne.Do(func() {
-				mw.statusBar.SetText("Reply sent successfully")
-			})
-		},
-		OnClosed: func() {
-			mw.statusBar.SetText("Reply window closed")
-		},
-	}
-
-	composeWindow := NewComposeWindow(mw.app, mw.configManagerToConfig(), opts)
-	composeWindow.Show()
-}
-
-func (mw *MainWindow) forwardMessage() {
-	if mw.selectedMessage == nil {
-		dialog.ShowInformation("No Message", "Please select a message to forward", mw.window)
-		return
-	}
-
-	// Get account from config using the account name from MessageIndexItem
-	account := mw.getAccountByName(mw.selectedMessage.AccountName)
-	if account == nil {
-		dialog.ShowError(fmt.Errorf("Cannot forward: account %s not found", mw.selectedMessage.AccountName), mw.window)
-		return
-	}
-
-	opts := ComposeOptions{
-		Account:        account,
-		SMTPClient:     mw.smtpClientForAccount(account),
-		IMAPClient:     mw.imapClientForAccount(account),
-		AddressbookMgr: mw.addressbookMgr,
-		Forward:        &mw.selectedMessage.Message,
-		OnSent: func() {
-			mw.refreshSentFolderAfterSend(account)
-			fyne.Do(func() {
-				mw.statusBar.SetText("Message forwarded successfully")
-			})
-		},
-		OnClosed: func() {
-			mw.statusBar.SetText("Forward window closed")
-		},
-	}
-
-	composeWindow := NewComposeWindow(mw.app, mw.configManagerToConfig(), opts)
-	composeWindow.Show()
-}
-
 func (mw *MainWindow) deleteMessage() {
 	// Check if multiple messages are selected
 	selectedMessages := mw.getSelectedMessages()
@@ -3983,14 +3910,7 @@ func (mw *MainWindow) moveToTrash() {
 		imapClient = accountClient
 
 		// Get the account configuration
-		accounts := mw.config.GetAccounts()
-		for i, account := range accounts {
-			if account.Name == mw.selectedMessage.AccountName {
-				currentAccount = &accounts[i]
-				break
-			}
-		}
-
+		currentAccount = mw.getAccountByName(mw.selectedMessage.AccountName)
 		if currentAccount == nil {
 			dialog.ShowInformation("Account Error", fmt.Sprintf("Account configuration not found for %s", mw.selectedMessage.AccountName), mw.window)
 			return
@@ -4592,15 +4512,8 @@ func (mw *MainWindow) showMessageHeaders() {
 		var imapClient *imap.ClientWrapper
 		if mw.accountController.IsUnifiedInbox() {
 			// Get the account-specific IMAP client
-			accounts := mw.config.GetAccounts()
-			for _, acc := range accounts {
-				if acc.Name == selMsg.AccountName {
-					// Get the IMAP client for this specific account
-					if accountClient, exists := mw.accountController.GetIMAPClientForAccount(acc.Name); exists {
-						imapClient = accountClient
-						break
-					}
-				}
+			if accountClient, exists := mw.accountController.GetIMAPClientForAccount(selMsg.AccountName); exists {
+				imapClient = accountClient
 			}
 		} else {
 			// Regular mode - use current IMAP client
