@@ -3,7 +3,9 @@ module github.com/wltechblog/gommail
 go 1.24.1
 
 require (
-	fyne.io/fyne/v2 v2.8.1
+	// Pinned to the develop commit that introduced RichText.Selectable
+	// (fyne-io/fyne#5946); swap for the v2.9 tag once it is released.
+	fyne.io/fyne/v2 v2.8.2-0.20261009111023-0a528b3a387b
 	github.com/PuerkitoBio/goquery v1.11.0
 	github.com/dweymouth/fyne-tooltip v0.4.0
 	github.com/emersion/go-imap/v2 v2.0.0-beta.8
@@ -26,11 +28,11 @@ require (
 	github.com/fyne-io/gl-js v0.2.1-0.20260315212741-029c47fd27e8 // indirect
 	github.com/fyne-io/glfw-js v0.4.0 // indirect
 	github.com/fyne-io/image v0.1.1 // indirect
-	github.com/fyne-io/oksvg v0.2.0 // indirect
+	github.com/fyne-io/oksvg v0.2.1-0.20260918172519-a9af55fa95d9 // indirect
 	github.com/go-gl/gl v0.0.0-20260331235117-4566fea9a276 // indirect
-	github.com/go-gl/glfw/v3.4/glfw v0.1.0-pre.1.0.20260707082822-2a407d02d01a // indirect
+	github.com/go-gl/glfw/v3.4/glfw v0.1.0-pre.2 // indirect
 	github.com/go-text/render v0.2.1 // indirect
-	github.com/go-text/typesetting v0.3.4 // indirect
+	github.com/go-text/typesetting v0.3.5 // indirect
 	github.com/hack-pad/go-indexeddb v0.3.2 // indirect
 	github.com/hack-pad/safejs v0.1.0 // indirect
 	github.com/jeandeaual/go-locale v0.0.0-20250612000132-0ef82f21eade // indirect

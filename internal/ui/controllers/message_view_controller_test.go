@@ -494,3 +494,72 @@ func TestGetters(t *testing.T) {
 		t.Error("GetMessageContainer should not return nil")
 	}
 }
+
+func TestCopyableMessageText(t *testing.T) {
+	mockMgr := newMockAttachmentManager()
+	mvc := NewMessageViewController(mockMgr, false)
+
+	if got := mvc.CopyableMessageText(); got != "" {
+		t.Errorf("CopyableMessageText before any message displayed = %q, want empty", got)
+	}
+
+	msg := &email.Message{
+		Subject: "Quarterly Report",
+		From:    []email.Address{{Name: "Sender", Email: "sender@example.com"}},
+		To:      []email.Address{{Name: "Recipient", Email: "recipient@example.com"}},
+		CC:      []email.Address{{Name: "CCed", Email: "cc@example.com"}},
+		Date:    time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC),
+		Body:    email.MessageBody{Text: "The report is attached."},
+	}
+	formatAddresses := func(addrs []email.Address) string {
+		if len(addrs) == 0 {
+			return ""
+		}
+		return addrs[0].Name + " <" + addrs[0].Email + ">"
+	}
+	getDisplayDate := func(m *email.Message) string { return "Oct 9" }
+
+	// Store the same state DisplayMessage records; calling DisplayMessage
+	// directly requires a Fyne app for markdown rendering.
+	mvc.currentMessage = msg
+	mvc.formatAddresses = formatAddresses
+	mvc.getDisplayDate = getDisplayDate
+
+	got := mvc.CopyableMessageText()
+	for _, want := range []string{
+		"Subject: Quarterly Report\n",
+		"From: Sender <sender@example.com>\n",
+		"To: Recipient <recipient@example.com>\n",
+		"CC: CCed <cc@example.com>\n",
+		"Date: Oct 9\n\n",
+		"The report is attached.",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("CopyableMessageText missing %q; got:\n%s", want, got)
+		}
+	}
+}
+
+func TestCopyableMessageText_HTMLFallback(t *testing.T) {
+	mockMgr := newMockAttachmentManager()
+	mvc := NewMessageViewController(mockMgr, false)
+
+	msg := &email.Message{
+		Subject: "HTML only",
+		From:    []email.Address{{Email: "sender@example.com"}},
+		To:      []email.Address{{Email: "recipient@example.com"}},
+		Date:    time.Now(),
+		Body:    email.MessageBody{HTML: "<p>Rendered <strong>body</strong> text</p>"},
+	}
+	mvc.currentMessage = msg
+	mvc.formatAddresses = func(addrs []email.Address) string { return addrs[0].Email }
+	mvc.getDisplayDate = func(m *email.Message) string { return "now" }
+
+	got := mvc.CopyableMessageText()
+	if !strings.Contains(got, "Rendered body text") {
+		t.Errorf("HTML body should fall back to plain text conversion; got:\n%s", got)
+	}
+	if strings.Contains(got, "<p>") || strings.Contains(got, "<strong>") {
+		t.Errorf("Copyable text should not contain HTML tags; got:\n%s", got)
+	}
+}

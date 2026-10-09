@@ -2984,6 +2984,24 @@ func (mw *MainWindow) displayMessage(msg *email.Message) {
 	mw.updateAttachmentSection(msg)
 }
 
+// copyMessageText copies the current in-widget text selection to the
+// clipboard, falling back to the full text of the displayed message when
+// nothing is selected. The selectable RichText handles Ctrl+C itself while
+// it holds focus; this covers every other focus location.
+func (mw *MainWindow) copyMessageText() {
+	if selected := mw.messageViewController.GetSelectedText(); selected != "" {
+		mw.window.Clipboard().SetContent(selected)
+		mw.statusBar.SetText("Copied selected text to clipboard")
+		return
+	}
+	if text := mw.messageViewController.CopyableMessageText(); text != "" {
+		mw.window.Clipboard().SetContent(text)
+		mw.statusBar.SetText("Copied message text to clipboard")
+		return
+	}
+	mw.statusBar.SetText("No message text to copy")
+}
+
 // Multiple selection helper methods
 
 // isMessageSelected returns true if the message at the given index is selected
@@ -4847,6 +4865,11 @@ func (mw *MainWindow) createSingleMessageContextMenu() *fyne.Container {
 		mw.showMessageHeaders()
 	})
 
+	copyTextButton := mw.createContextMenuButton("Copy Text", func() {
+		mw.currentContextPopup.Hide()
+		mw.copyMessageText()
+	})
+
 	moveToFolderButton := mw.createContextMenuButton("Move to Folder...", func() {
 		mw.currentContextPopup.Hide()
 		mw.showMoveToFolderDialog()
@@ -4863,6 +4886,7 @@ func (mw *MainWindow) createSingleMessageContextMenu() *fyne.Container {
 		forwardButton,
 		widget.NewSeparator(),
 		viewHeadersButton,
+		copyTextButton,
 		widget.NewSeparator(),
 		moveToFolderButton,
 		widget.NewSeparator(),
@@ -6612,6 +6636,9 @@ func (mw *MainWindow) registerKeyboardShortcuts() {
 	})
 
 	// Edit shortcuts
+	canvas.AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyC, Modifier: fyne.KeyModifierControl}, func(shortcut fyne.Shortcut) {
+		mw.copyMessageText()
+	})
 	canvas.AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyF, Modifier: fyne.KeyModifierControl | fyne.KeyModifierShift}, func(shortcut fyne.Shortcut) {
 		mw.showSearch()
 	})

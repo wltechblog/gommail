@@ -32,6 +32,12 @@ type MessageViewControllerImpl struct {
 	// View state
 	showHTMLContent bool
 
+	// The message currently shown in the viewer, kept so clipboard copy
+	// can use the source body rather than the display-truncated markdown.
+	currentMessage  *email.Message
+	formatAddresses func([]email.Address) string
+	getDisplayDate  func(*email.Message) string
+
 	// Dependencies
 	attachmentManager AttachmentManager
 
@@ -51,6 +57,9 @@ type AttachmentManager interface {
 func NewMessageViewController(attachmentManager AttachmentManager, showHTMLByDefault bool) *MessageViewControllerImpl {
 	messageViewer := widget.NewRichText()
 	messageViewer.Wrapping = fyne.TextWrapWord
+	// Enable text selection so users can drag-select and Ctrl+C message
+	// content (fyne-io/fyne#5946, RichText.Selectable since Fyne 2.9).
+	messageViewer.Selectable = true
 	attachmentSection := container.NewVBox()
 	messageContainer := container.NewBorder(
 		nil, attachmentSection, nil, nil,
@@ -74,6 +83,10 @@ func (mvc *MessageViewControllerImpl) SetOnViewToggled(callback func(showHTML bo
 
 // DisplayMessage displays a message with headers and body content.
 func (mvc *MessageViewControllerImpl) DisplayMessage(msg *email.Message, formatAddresses func([]email.Address) string, getDisplayDate func(*email.Message) string) {
+	mvc.currentMessage = msg
+	mvc.formatAddresses = formatAddresses
+	mvc.getDisplayDate = getDisplayDate
+
 	var content strings.Builder
 
 	// Message header
@@ -148,11 +161,49 @@ func (mvc *MessageViewControllerImpl) UpdateMessageViewer(markdownContent string
 			fmt.Sprintf("\n\n---\n\n*⚠️ Message truncated: full content is %d KB, only the first %d KB is shown.*",
 				originalLen/1024, truncPoint/1024)
 	}
+	// Any prior selection refers to the replaced content, so drop it
+	// before the new markdown is parsed.
+	mvc.messageViewer.ClearSelection()
 	mvc.messageViewer.ParseMarkdown(markdownContent)
+}
+
+// GetSelectedText returns the text currently selected in the message viewer,
+// or an empty string when nothing is selected.
+func (mvc *MessageViewControllerImpl) GetSelectedText() string {
+	return mvc.messageViewer.SelectedText()
+}
+
+// CopyableMessageText returns a plain-text representation of the currently
+// displayed message (headers plus body). Unlike the rendered view, it is not
+// subject to the display truncation limit.
+func (mvc *MessageViewControllerImpl) CopyableMessageText() string {
+	msg := mvc.currentMessage
+	if msg == nil || mvc.formatAddresses == nil || mvc.getDisplayDate == nil {
+		return ""
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "Subject: %s\n", msg.Subject)
+	fmt.Fprintf(&b, "From: %s\n", mvc.formatAddresses(msg.From))
+	fmt.Fprintf(&b, "To: %s\n", mvc.formatAddresses(msg.To))
+	if len(msg.CC) > 0 {
+		fmt.Fprintf(&b, "CC: %s\n", mvc.formatAddresses(msg.CC))
+	}
+	fmt.Fprintf(&b, "Date: %s\n\n", mvc.getDisplayDate(msg))
+
+	body := msg.Body.Text
+	if body == "" && msg.Body.HTML != "" {
+		body = mvc.HTMLToPlainText(msg.Body.HTML)
+	}
+	b.WriteString(body)
+	return b.String()
 }
 
 // ClearMessageView clears the message viewer.
 func (mvc *MessageViewControllerImpl) ClearMessageView() {
+	mvc.currentMessage = nil
+	mvc.formatAddresses = nil
+	mvc.getDisplayDate = nil
 	mvc.UpdateMessageViewer("Select a message to view")
 	mvc.attachmentSection.Objects = nil
 	mvc.attachmentSection.Refresh()
