@@ -117,7 +117,7 @@ func main() {
 
 	// Show version information
 	if *versionFlag {
-		fmt.Println("gommail client v0.3.0")
+		fmt.Println("gommail client v" + resources.AppVersion)
 		fmt.Println("A simple email client written in Go")
 		os.Exit(0)
 	}

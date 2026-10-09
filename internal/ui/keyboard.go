@@ -11,6 +11,8 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/driver/desktop"
+
+	"github.com/wltechblog/gommail/internal/resources"
 )
 
 // registerKeyboardShortcuts registers keyboard shortcuts with the window canvas
@@ -95,8 +97,8 @@ func (mw *MainWindow) registerKeyboardShortcuts() {
 
 // showAbout displays the about dialog
 func (mw *MainWindow) showAbout() {
-	about := `gommail client
-Version 1.0.0
+	about := fmt.Sprintf(`gommail client
+Version %s
 
 A high-performance email client written in Go using the Fyne UI toolkit.
 
@@ -107,7 +109,7 @@ Features:
 • Filesystem Caching
 • Cross-Platform Support
 
-Built with ❤️ using Go and Fyne`
+Built with ❤️ using Go and Fyne`, resources.AppVersion)
 
 	dialog.ShowInformation("About gommail client", about, mw.window)
 }

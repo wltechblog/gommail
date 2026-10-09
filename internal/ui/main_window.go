@@ -95,23 +95,6 @@ func messageViewModeStatusText(showHTML bool) string {
 	return "Showing plain text message view"
 }
 
-// SortBy represents the sorting criteria for messages
-type SortBy int
-
-const (
-	SortByDate SortBy = iota
-	SortBySender
-	SortBySubject
-)
-
-// SortOrder represents the sorting order
-type SortOrder int
-
-const (
-	SortAscending SortOrder = iota
-	SortDescending
-)
-
 const (
 	messageDateColumnWidth   float32 = 120
 	messageSenderColumnWidth float32 = 180
@@ -201,8 +184,6 @@ type MainWindow struct {
 	selectedMessage *email.MessageIndexItem
 
 	// Sorting state - synchronized with MessageListController
-	sortBy    SortBy
-	sortOrder SortOrder
 
 	// HTML/Text view toggle
 	showHTMLContent bool
@@ -367,8 +348,6 @@ func NewMainWindow(app fyne.App, cfg config.ConfigManager) *MainWindow {
 		addressbookMgr:        addressbookMgr,
 		messages:              make([]email.MessageIndexItem, 0),
 		autoSelectionDone:     false,
-		sortBy:                SortByDate,     // Default sort by date
-		sortOrder:             SortDescending, // Newest first
 		tooltipLayerEnabled:   true,
 		selectionManager:      controllers.NewSelectionManager(),
 		messageViewController: messageViewController,
@@ -922,29 +901,14 @@ func (mw *MainWindow) sortFolders(folders []email.Folder) []email.Folder {
 	return mw.folderController.SortFolders(folders)
 }
 
-// sortMessages sorts the messages based on current sort criteria
-// Delegates to MessageListController
+// sortMessages sorts the messages based on current sort criteria.
+// The MessageListController owns the sort state.
 func (mw *MainWindow) sortMessages() {
 	// Update controller's IMAP/SMTP clients before sorting
 	mw.messageListController.SetIMAPClient(mw.imapClient)
 	mw.messageListController.SetSMTPClient(mw.smtpClient)
 
-	// Sync sort state to controller
-	var controllerSortBy controllers.SortBy
-	switch mw.sortBy {
-	case SortByDate:
-		controllerSortBy = controllers.SortByDate
-	case SortBySender:
-		controllerSortBy = controllers.SortBySender
-	case SortBySubject:
-		controllerSortBy = controllers.SortBySubject
-	default:
-		controllerSortBy = controllers.SortByDate
-	}
-
-	// Set messages and sort criteria in controller
 	mw.messageListController.SetMessages(mw.messages)
-	mw.messageListController.SetSortCriteria(controllerSortBy, controllers.SortOrder(mw.sortOrder))
 	mw.messageListController.SortMessages()
 
 	// Sync back to MainWindow

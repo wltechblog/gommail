@@ -224,14 +224,12 @@ func TestMonitorConnectionHealthStopsWhenContextCancelled(t *testing.T) {
 // TestSortMessages tests the message sorting functionality
 func TestSortMessages(t *testing.T) {
 	// Create a MainWindow instance for testing with minimal initialization
-	mw := &MainWindow{
-		sortBy:    SortByDate,
-		sortOrder: SortDescending,
-	}
-
 	// Initialize messageListController with nil dependencies for this test
-	// (we're only testing sorting logic, not UI interactions)
-	mw.messageListController = controllers.NewMessageListController(nil, nil, nil)
+	// (we're only testing sorting logic, not UI interactions). The
+	// controller owns the sort state.
+	mw := &MainWindow{
+		messageListController: controllers.NewMessageListController(nil, nil, nil),
+	}
 
 	// Create test messages with different dates, senders, and subjects
 	now := time.Now()
@@ -263,8 +261,7 @@ func TestSortMessages(t *testing.T) {
 	}
 
 	// Test sorting by date (descending - newest first)
-	mw.sortBy = SortByDate
-	mw.sortOrder = SortDescending
+	mw.messageListController.SetSortCriteria(controllers.SortByDate, controllers.SortDescending)
 	mw.sortMessages()
 
 	if mw.messages[0].Message.Subject != "Gamma Subject" {
@@ -275,7 +272,7 @@ func TestSortMessages(t *testing.T) {
 	}
 
 	// Test sorting by date (ascending - oldest first)
-	mw.sortOrder = SortAscending
+	mw.messageListController.SetSortCriteria(controllers.SortByDate, controllers.SortAscending)
 	mw.sortMessages()
 
 	if mw.messages[0].Message.Subject != "Beta Subject" {
@@ -286,8 +283,7 @@ func TestSortMessages(t *testing.T) {
 	}
 
 	// Test sorting by sender (ascending)
-	mw.sortBy = SortBySender
-	mw.sortOrder = SortAscending
+	mw.messageListController.SetSortCriteria(controllers.SortBySender, controllers.SortAscending)
 	mw.sortMessages()
 
 	if mw.getSenderNameFromIndexItem(mw.messages[0]) != "Alice" {
@@ -298,8 +294,7 @@ func TestSortMessages(t *testing.T) {
 	}
 
 	// Test sorting by subject (ascending)
-	mw.sortBy = SortBySubject
-	mw.sortOrder = SortAscending
+	mw.messageListController.SetSortCriteria(controllers.SortBySubject, controllers.SortAscending)
 	mw.sortMessages()
 
 	if mw.messages[0].Message.Subject != "Alpha Subject" {
@@ -354,61 +349,40 @@ func TestGetSortName(t *testing.T) {
 		messageListController: controllers.NewMessageListController(nil, nil, nil),
 	}
 
-	mw.sortBy = SortByDate
 	mw.messageListController.SetSortCriteria(controllers.SortByDate, controllers.SortDescending)
 	if name := mw.getSortName(); name != "date" {
 		t.Errorf("Expected 'date', got '%s'", name)
 	}
 
-	mw.sortBy = SortBySender
 	mw.messageListController.SetSortCriteria(controllers.SortBySender, controllers.SortAscending)
 	if name := mw.getSortName(); name != "sender" {
 		t.Errorf("Expected 'sender', got '%s'", name)
 	}
 
-	mw.sortBy = SortBySubject
 	mw.messageListController.SetSortCriteria(controllers.SortBySubject, controllers.SortAscending)
 	if name := mw.getSortName(); name != "subject" {
 		t.Errorf("Expected 'subject', got '%s'", name)
 	}
 }
 
-// TestSortLogic tests the sort criteria change logic without UI components
+// TestSortLogic tests the sort criteria change logic against the controller,
+// which owns the sort state.
 func TestSortLogic(t *testing.T) {
-	mw := &MainWindow{
-		sortBy:    SortByDate,
-		sortOrder: SortDescending,
-		messages: []email.MessageIndexItem{
-			{Message: email.Message{Subject: "B", From: []email.Address{{Name: "Alice"}}, Date: time.Now().Add(-1 * time.Hour)}, AccountName: "Test"},
-			{Message: email.Message{Subject: "A", From: []email.Address{{Name: "Bob"}}, Date: time.Now()}, AccountName: "Test"},
-		},
+	mlc := controllers.NewMessageListController(nil, nil, nil)
+
+	// Changing criteria defaults text fields to ascending
+	mlc.SetSortCriteria(controllers.SortBySender, controllers.SortAscending)
+	if mlc.GetSortBy() != controllers.SortBySender {
+		t.Errorf("Expected sortBy to be SortBySender, got %v", mlc.GetSortBy())
+	}
+	if mlc.GetSortOrder() != controllers.SortAscending {
+		t.Errorf("Expected sortOrder to be SortAscending, got %v", mlc.GetSortOrder())
 	}
 
-	// Test changing to sender sort (should default to ascending)
-	// Simulate the logic from setSortBy without UI updates
-	if mw.sortBy != SortBySender {
-		mw.sortBy = SortBySender
-		mw.sortOrder = SortAscending // Default for text fields
-	}
-
-	if mw.sortBy != SortBySender {
-		t.Errorf("Expected sortBy to be SortBySender, got %v", mw.sortBy)
-	}
-	if mw.sortOrder != SortAscending {
-		t.Errorf("Expected sortOrder to be SortAscending for new criteria, got %v", mw.sortOrder)
-	}
-
-	// Test clicking same criteria (should toggle order)
-	if mw.sortBy == SortBySender {
-		if mw.sortOrder == SortAscending {
-			mw.sortOrder = SortDescending
-		} else {
-			mw.sortOrder = SortAscending
-		}
-	}
-
-	if mw.sortOrder != SortDescending {
-		t.Errorf("Expected sortOrder to toggle to SortDescending, got %v", mw.sortOrder)
+	// Toggling flips the order
+	mlc.ToggleSortOrder()
+	if mlc.GetSortOrder() != controllers.SortDescending {
+		t.Errorf("Expected sortOrder to toggle to SortDescending, got %v", mlc.GetSortOrder())
 	}
 }
 
@@ -870,8 +844,6 @@ func TestTimezoneHandlingInSorting(t *testing.T) {
 	jstLocation, _ := time.LoadLocation("Asia/Tokyo")          // UTC+9
 
 	mw := &MainWindow{
-		sortBy:                SortByDate,
-		sortOrder:             SortDescending,
 		messageListController: controllers.NewMessageListController(nil, nil, nil),
 	}
 
