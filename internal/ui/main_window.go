@@ -121,6 +121,19 @@ const (
 	messageSenderColumnWidth float32 = 180
 )
 
+// truncateRunes shortens s to at most max runes without splitting a
+// multi-byte character.
+func truncateRunes(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	return string(runes[:max])
+}
+
 // MainWindow represents the main application window.
 //
 // Architecture:
@@ -202,10 +215,16 @@ type MainWindow struct {
 	autoSelectionDone bool
 
 	// Fresh fetch state
+	// freshFetchMu guards freshFetchInProgress, which is touched by
+	// concurrent folder-load goroutines.
+	freshFetchMu        sync.Mutex
 	freshFetchInProgress bool
 
 	// Read timer state
-	readTimer *time.Timer
+	// readTimerMu guards readTimer: it is armed/cancelled on the UI thread
+	// and cleared from the timer's own goroutine.
+	readTimerMu sync.Mutex
+	readTimer   *time.Timer
 
 	// Right-click detection
 	// Message list wrapper that handles right-click events on individual message items
@@ -607,9 +626,10 @@ func (m *messageListItem) updateContent(messageID int, message *email.MessageInd
 			senderName = fmt.Sprintf("[%s] %s", message.AccountName, senderName)
 		}
 
-		// Truncate long sender names to fit in column
+		// Truncate long sender names to fit in column. Byte-slicing would
+		// cut mid-rune and render invalid UTF-8 for non-ASCII names.
 		if len(senderName) > 25 { // Increased limit to accommodate account name
-			senderName = senderName[:22] + "..."
+			senderName = truncateRunes(senderName, 22) + "..."
 		}
 		m.senderLabel.SetText(senderName)
 
@@ -1418,7 +1438,7 @@ func (mw *MainWindow) selectAccount(account *config.Account) {
 	mw.clearAccountState()
 
 	// Refresh UI components to show the cleared state
-	mw.messageList.UnselectAll()
+	mw.clearMessageSelection()
 	mw.refreshMessageList()
 	mw.updateMessageViewer("")
 	if folderList := mw.folderController.GetFolderList(); folderList != nil {
@@ -1713,7 +1733,7 @@ func (mw *MainWindow) loadUnifiedInboxMessages(forceRefresh bool) {
 
 			mw.messages = cachedMessages
 			mw.sortMessages()
-			mw.messageList.UnselectAll()
+			mw.clearMessageSelection()
 			mw.refreshMessageList()
 			mw.statusBar.SetText(fmt.Sprintf("Loaded %d cached messages from unified inbox (checking for updates...)", len(mw.messages)))
 		})
@@ -1721,7 +1741,7 @@ func (mw *MainWindow) loadUnifiedInboxMessages(forceRefresh bool) {
 		// Show loading state immediately when cache is unavailable.
 		fyne.Do(func() {
 			mw.messages = []email.MessageIndexItem{}
-			mw.messageList.UnselectAll()
+			mw.clearMessageSelection()
 			mw.refreshMessageList()
 			mw.statusBar.SetText("Loading messages from all accounts...")
 		})
@@ -1877,7 +1897,7 @@ func (mw *MainWindow) fetchFreshUnifiedInboxMessagesInBackground() {
 			}
 
 			// Force the list to update by clearing selection and refreshing
-			mw.messageList.UnselectAll()
+			mw.clearMessageSelection()
 			mw.refreshMessageList()
 
 			mw.logger.Info("Refreshed message list with %d total messages", len(mw.messages))
@@ -1986,7 +2006,7 @@ func (mw *MainWindow) refreshSingleAccountInUnifiedInbox(accountName string) {
 			mw.sortMessages()
 
 			// Force the list to update
-			mw.messageList.UnselectAll()
+			mw.clearMessageSelection()
 			mw.refreshMessageList()
 
 			mw.statusBar.SetText(fmt.Sprintf("Added %d new messages from %s", changedCount, accountName))
@@ -2064,7 +2084,7 @@ func (mw *MainWindow) injectNewMessagesIntoUnifiedInboxForAccount(accountName, f
 		if changedCount > 0 {
 			mw.logger.Info("Injected %d new messages from account %s (total now: %d)", changedCount, accountName, afterCount)
 			mw.sortMessages()
-			mw.messageList.UnselectAll()
+			mw.clearMessageSelection()
 			mw.refreshMessageList()
 			mw.statusBar.SetText(fmt.Sprintf("New messages from %s (%d)", accountName, changedCount))
 		} else {
@@ -2329,14 +2349,18 @@ func (mw *MainWindow) getAccountForMessage(msg *email.Message) (*config.Account,
 		return mw.accountController.GetCurrentAccount(), mw.smtpClient, nil
 	}
 
-	// Unified inbox mode - find the account for the specific message
+	// Unified inbox mode - find the account for the specific message.
+	// Called from the read-timer goroutine, so the message list must be
+	// read under its mutex.
 	var accountName string
+	mw.messagesMu.RLock()
 	for _, indexItem := range mw.messages {
 		if indexItem.Message.UID == msg.UID && indexItem.Message.Subject == msg.Subject {
 			accountName = indexItem.AccountName
 			break
 		}
 	}
+	mw.messagesMu.RUnlock()
 
 	if accountName == "" {
 		return nil, nil, fmt.Errorf("could not find account for message")
@@ -2441,13 +2465,18 @@ func (mw *MainWindow) selectFolderWithOptions(folder string, forceRefresh bool) 
 	// cache for instant display, while refresh paths can force a server sync.
 	go func() {
 		// Prevent concurrent fresh fetches
+		mw.freshFetchMu.Lock()
 		if mw.freshFetchInProgress {
+			mw.freshFetchMu.Unlock()
 			mw.logger.Debug("Fresh fetch already in progress for folder %s, skipping", folder)
 			return
 		}
 		mw.freshFetchInProgress = true
+		mw.freshFetchMu.Unlock()
 		defer func() {
+			mw.freshFetchMu.Lock()
 			mw.freshFetchInProgress = false
+			mw.freshFetchMu.Unlock()
 		}()
 
 		// First, try to load from cache directly for immediate display
@@ -2460,7 +2489,7 @@ func (mw *MainWindow) selectFolderWithOptions(folder string, forceRefresh bool) 
 				mw.sortMessages()
 
 				// Force the list to update by clearing selection and refreshing
-				mw.messageList.UnselectAll()
+				mw.clearMessageSelection()
 				mw.refreshMessageList()
 
 				mw.updateFolderMessageCount(folder, len(cachedMessages))
@@ -2501,7 +2530,7 @@ func (mw *MainWindow) selectFolderWithOptions(folder string, forceRefresh bool) 
 					if len(mw.messages) == 0 {
 						mw.statusBar.SetText(fmt.Sprintf("Failed to load messages from %s: %v", folder, err))
 						mw.messages = []email.MessageIndexItem{}
-						mw.messageList.UnselectAll()
+						mw.clearMessageSelection()
 						mw.refreshMessageList()
 					} else {
 						mw.statusBar.SetText(fmt.Sprintf("Using cached messages (%d) - server unavailable", len(mw.messages)))
@@ -2521,7 +2550,7 @@ func (mw *MainWindow) selectFolderWithOptions(folder string, forceRefresh bool) 
 				mw.sortMessages()
 
 				// Force the list to update by clearing selection and refreshing
-				mw.messageList.UnselectAll()
+				mw.clearMessageSelection()
 				mw.refreshMessageList()
 
 				newCount := len(messages)
@@ -2616,6 +2645,15 @@ func (mw *MainWindow) selectMessage(id widget.ListItemID) {
 				previouslySelectedIndex = i
 				break
 			}
+		}
+	}
+
+	// A single click replaces any prior multi-selection: drop the manager's
+	// stale indices and highlights so it agrees with mw.selectedMessage.
+	if mw.selectionManager != nil && mw.selectionManager.GetSelectionCount() > 0 {
+		mw.selectionManager.ClearSelection()
+		if mw.messageList != nil {
+			mw.messageList.UnselectAll()
 		}
 	}
 
@@ -2903,6 +2941,22 @@ func (mw *MainWindow) selectMessageMultiple(index int, ctrlPressed, shiftPressed
 }
 
 // clearSelection clears all message selections
+// clearMessageSelection drops all selection state: the manager's indices,
+// the single selected message, and the widget highlights. Every code path
+// that reloads or replaces mw.messages must call this, otherwise the
+// manager keeps indices into the old slice.
+func (mw *MainWindow) clearMessageSelection() {
+	if mw.selectionManager != nil {
+		mw.selectionManager.ClearSelection()
+	}
+	mw.messagesMu.Lock()
+	mw.selectedMessage = nil
+	mw.messagesMu.Unlock()
+	if mw.messageList != nil {
+		mw.clearMessageSelection()
+	}
+}
+
 func (mw *MainWindow) clearSelection() {
 	mw.selectionManager.ClearSelection()
 	mw.selectedMessage = nil
@@ -2931,31 +2985,45 @@ func (mw *MainWindow) moveToTrashMultiple() {
 
 // performMoveToTrashMultiple performs the actual move to trash operation for multiple messages
 func (mw *MainWindow) performMoveToTrashMultiple(messages []*email.MessageIndexItem) {
-	mw.statusBar.SetText(fmt.Sprintf("Moving %d messages to trash...", len(messages)))
+	mw.runBatchMessageOp(messages, mw.performSingleMoveToTrash,
+		func(n int) string { return fmt.Sprintf("Moving %d messages to trash...", n) },
+		func(ok, fail int) string {
+			if fail == 0 {
+				return fmt.Sprintf("Moved %d messages to trash", ok)
+			}
+			return fmt.Sprintf("Moved %d messages to trash, %d failed", ok, fail)
+		})
+}
 
-	successCount := 0
-	errorCount := 0
+// runBatchMessageOp runs a blocking per-message IMAP operation off the UI
+// thread, then reports the tally, clears the selection and refreshes the
+// message list on the UI thread.
+func (mw *MainWindow) runBatchMessageOp(messages []*email.MessageIndexItem,
+	op func(*email.MessageIndexItem) error,
+	progressMsg func(n int) string,
+	doneMsg func(ok, fail int) string) {
 
-	for _, msg := range messages {
-		err := mw.performSingleMoveToTrash(msg)
-		if err != nil {
-			mw.logger.Error("Failed to move message to trash: %v", err)
-			errorCount++
-		} else {
-			successCount++
+	mw.statusBar.SetText(progressMsg(len(messages)))
+
+	go func() {
+		successCount := 0
+		errorCount := 0
+
+		for _, msg := range messages {
+			if err := op(msg); err != nil {
+				mw.logger.Error("Batch message operation failed: %v", err)
+				errorCount++
+			} else {
+				successCount++
+			}
 		}
-	}
 
-	// Update status
-	if errorCount == 0 {
-		mw.statusBar.SetText(fmt.Sprintf("Moved %d messages to trash", successCount))
-	} else {
-		mw.statusBar.SetText(fmt.Sprintf("Moved %d messages to trash, %d failed", successCount, errorCount))
-	}
-
-	// Clear selection and refresh
-	mw.clearSelection()
-	mw.refreshMessageList()
+		fyne.Do(func() {
+			mw.statusBar.SetText(doneMsg(successCount, errorCount))
+			mw.clearSelection()
+			mw.refreshMessageList()
+		})
+	}()
 }
 
 // performSingleMoveToTrash moves a single message to trash (extracted from existing logic)
@@ -3039,57 +3107,40 @@ func (mw *MainWindow) showMoveToFolderDialogMultiple() {
 		return
 	}
 
-	// Create folder selection dialog
-	go func() {
-		folderNames := make([]string, len(folders))
-		for i, folder := range folders {
-			folderNames[i] = folder.Name
+	// Create folder selection dialog (widget construction must stay on the
+	// UI thread; the folder list was already fetched above).
+	folderNames := make([]string, len(folders))
+	for i, folder := range folders {
+		folderNames[i] = folder.Name
+	}
+
+	folderSelect := widget.NewSelect(folderNames, nil)
+	folderSelect.PlaceHolder = "Select a folder..."
+
+	content := container.NewVBox(
+		widget.NewLabel(fmt.Sprintf("Move %d messages to folder:", len(selectedMessages))),
+		folderSelect,
+	)
+
+	dialog.ShowCustomConfirm("Move Messages", "Move", "Cancel", content, func(confirmed bool) {
+		if confirmed && folderSelect.Selected != "" {
+			mw.logger.Debug("Moving %d messages to folder: %s", len(selectedMessages), folderSelect.Selected)
+			mw.moveToFolderMultiple(selectedMessages, folderSelect.Selected)
 		}
-
-		folderSelect := widget.NewSelect(folderNames, nil)
-		folderSelect.PlaceHolder = "Select a folder..."
-
-		content := container.NewVBox(
-			widget.NewLabel(fmt.Sprintf("Move %d messages to folder:", len(selectedMessages))),
-			folderSelect,
-		)
-
-		dialog.ShowCustomConfirm("Move Messages", "Move", "Cancel", content, func(confirmed bool) {
-			if confirmed && folderSelect.Selected != "" {
-				mw.logger.Debug("Moving %d messages to folder: %s", len(selectedMessages), folderSelect.Selected)
-				mw.moveToFolderMultiple(selectedMessages, folderSelect.Selected)
-			}
-		}, mw.window)
-	}()
+	}, mw.window)
 }
 
 // moveToFolderMultiple moves multiple messages to the specified folder
 func (mw *MainWindow) moveToFolderMultiple(messages []*email.MessageIndexItem, folderName string) {
-	mw.statusBar.SetText(fmt.Sprintf("Moving %d messages to %s...", len(messages), folderName))
-
-	successCount := 0
-	errorCount := 0
-
-	for _, msg := range messages {
-		err := mw.performSingleMoveToFolder(msg, folderName)
-		if err != nil {
-			mw.logger.Error("Failed to move message to folder %s: %v", folderName, err)
-			errorCount++
-		} else {
-			successCount++
-		}
-	}
-
-	// Update status
-	if errorCount == 0 {
-		mw.statusBar.SetText(fmt.Sprintf("Moved %d messages to %s", successCount, folderName))
-	} else {
-		mw.statusBar.SetText(fmt.Sprintf("Moved %d messages to %s, %d failed", successCount, folderName, errorCount))
-	}
-
-	// Clear selection and refresh
-	mw.clearSelection()
-	mw.refreshMessageList()
+	mw.runBatchMessageOp(messages,
+		func(msg *email.MessageIndexItem) error { return mw.performSingleMoveToFolder(msg, folderName) },
+		func(n int) string { return fmt.Sprintf("Moving %d messages to %s...", n, folderName) },
+		func(ok, fail int) string {
+			if fail == 0 {
+				return fmt.Sprintf("Moved %d messages to %s", ok, folderName)
+			}
+			return fmt.Sprintf("Moved %d messages to %s, %d failed", ok, folderName, fail)
+		})
 }
 
 // performSingleMoveToFolder moves a single message to the specified folder
@@ -3136,31 +3187,15 @@ func (mw *MainWindow) deleteMessagesMultiple() {
 
 // performDeleteMultiple performs the actual delete operation for multiple messages
 func (mw *MainWindow) performDeleteMultiple(messages []*email.MessageIndexItem) {
-	mw.statusBar.SetText(fmt.Sprintf("Deleting %d messages...", len(messages)))
-
-	successCount := 0
-	errorCount := 0
-
-	for _, msg := range messages {
-		err := msg.Delete()
-		if err != nil {
-			mw.logger.Error("Failed to delete message: %v", err)
-			errorCount++
-		} else {
-			successCount++
-		}
-	}
-
-	// Update status
-	if errorCount == 0 {
-		mw.statusBar.SetText(fmt.Sprintf("Deleted %d messages", successCount))
-	} else {
-		mw.statusBar.SetText(fmt.Sprintf("Deleted %d messages, %d failed", successCount, errorCount))
-	}
-
-	// Clear selection and refresh
-	mw.clearSelection()
-	mw.refreshMessageList()
+	mw.runBatchMessageOp(messages,
+		func(msg *email.MessageIndexItem) error { return msg.Delete() },
+		func(n int) string { return fmt.Sprintf("Deleting %d messages...", n) },
+		func(ok, fail int) string {
+			if fail == 0 {
+				return fmt.Sprintf("Deleted %d messages", ok)
+			}
+			return fmt.Sprintf("Deleted %d messages, %d failed", ok, fail)
+		})
 }
 
 // selectAllMessages selects all messages in the current list
@@ -3755,6 +3790,24 @@ func (mw *MainWindow) showAccountSelectionForCompose() {
 	}, mw.window)
 }
 
+// smtpClientForAccount builds an SMTP client for the account. ClientWrapper
+// items carry their own client, but a typed-nil *smtp.Client inside the
+// SMTPClient interface (e.g. items built by search) survives an unchecked
+// assertion and panics later; building fresh from the account config is
+// always safe - the client is stateless apart from its config.
+func (mw *MainWindow) smtpClientForAccount(account *config.Account) *smtp.Client {
+	if account == nil {
+		return nil
+	}
+	return smtp.NewClient(email.ServerConfig{
+		Host:     account.SMTP.Host,
+		Port:     account.SMTP.Port,
+		Username: account.SMTP.Username,
+		Password: account.SMTP.Password,
+		TLS:      account.SMTP.TLS,
+	})
+}
+
 func (mw *MainWindow) replyToMessage() {
 	if mw.selectedMessage == nil {
 		dialog.ShowInformation("No Message", "Please select a message to reply to", mw.window)
@@ -3770,7 +3823,7 @@ func (mw *MainWindow) replyToMessage() {
 
 	opts := ComposeOptions{
 		Account:        account,
-		SMTPClient:     mw.selectedMessage.SMTPClient.(*smtp.Client),
+		SMTPClient:     mw.smtpClientForAccount(account),
 		IMAPClient:     mw.imapClientForAccount(account),
 		AddressbookMgr: mw.addressbookMgr,
 		ReplyTo:        &mw.selectedMessage.Message,
@@ -3804,7 +3857,7 @@ func (mw *MainWindow) replyAllToMessage() {
 
 	opts := ComposeOptions{
 		Account:        account,
-		SMTPClient:     mw.selectedMessage.SMTPClient.(*smtp.Client),
+		SMTPClient:     mw.smtpClientForAccount(account),
 		IMAPClient:     mw.imapClientForAccount(account),
 		AddressbookMgr: mw.addressbookMgr,
 		ReplyTo:        &mw.selectedMessage.Message,
@@ -3839,7 +3892,7 @@ func (mw *MainWindow) forwardMessage() {
 
 	opts := ComposeOptions{
 		Account:        account,
-		SMTPClient:     mw.selectedMessage.SMTPClient.(*smtp.Client),
+		SMTPClient:     mw.smtpClientForAccount(account),
 		IMAPClient:     mw.imapClientForAccount(account),
 		AddressbookMgr: mw.addressbookMgr,
 		Forward:        &mw.selectedMessage.Message,
@@ -4102,7 +4155,7 @@ func (mw *MainWindow) moveToTrash() {
 
 				// Clear current selection first to avoid stale references
 				mw.selectedMessage = nil
-				mw.messageList.UnselectAll()
+				mw.clearMessageSelection()
 
 				// Force the message list to refresh with new length
 				mw.refreshMessageList()
@@ -4240,7 +4293,7 @@ func (mw *MainWindow) performDelete() {
 
 				// Clear current selection first to avoid stale references
 				mw.selectedMessage = nil
-				mw.messageList.UnselectAll()
+				mw.clearMessageSelection()
 
 				// Force the message list to refresh with new length
 				mw.refreshMessageList()
@@ -5014,14 +5067,14 @@ func (mw *MainWindow) clearInMemoryData() {
 	mw.cancelReadTimer()
 
 	// Clear UI components
-	mw.messageList.UnselectAll()
+	mw.clearMessageSelection()
 	if folderList := mw.folderController.GetFolderList(); folderList != nil {
 		folderList.UnselectAll()
 	}
 	mw.accountList.UnselectAll()
 
 	// Refresh UI to show cleared state
-	mw.messageList.UnselectAll()
+	mw.clearMessageSelection()
 	mw.refreshMessageList()
 	if folderList := mw.folderController.GetFolderList(); folderList != nil {
 		folderList.Refresh()
@@ -5456,9 +5509,16 @@ func (mw *MainWindow) showSearch() {
 		return
 	}
 
+	// Guard against typed-nil wrappers: a nil *imap.ClientWrapper stored in
+	// an interface field is not == nil, defeating the search window's checks.
+	var searchClient email.IMAPClient
+	if mw.imapClient != nil {
+		searchClient = mw.imapClient
+	}
+
 	opts := SearchOptions{
 		Account:    mw.accountController.GetCurrentAccount(),
-		IMAPClient: mw.imapClient,
+		IMAPClient: searchClient,
 		OnMessageSelected: func(msg *email.Message) {
 			// Create a MessageIndexItem for the selected message
 			// We need to determine which folder this message came from
@@ -5474,8 +5534,8 @@ func (mw *MainWindow) showSearch() {
 				AccountName:  mw.accountController.GetCurrentAccount().Name,
 				AccountEmail: mw.accountController.GetCurrentAccount().Email,
 				FolderName:   folderName,
-				IMAPClient:   mw.imapClient,
-				SMTPClient:   mw.smtpClient,
+				IMAPClient:   searchClient,
+				SMTPClient:   mw.smtpClientForAccount(mw.accountController.GetCurrentAccount()),
 				AccountConfig: &email.AccountConfig{
 					Name:        mw.accountController.GetCurrentAccount().Name,
 					Email:       mw.accountController.GetCurrentAccount().Email,
@@ -5716,10 +5776,12 @@ func (mw *MainWindow) openAttachment(attachment email.Attachment) {
 // startReadTimer starts a 5-second timer to mark the message as read
 func (mw *MainWindow) startReadTimer(msg *email.Message) {
 	// Cancel any existing timer
+	mw.readTimerMu.Lock()
 	if mw.readTimer != nil {
 		mw.readTimer.Stop()
 		mw.readTimer = nil
 	}
+	mw.readTimerMu.Unlock()
 
 	// Check if message is already read
 	isRead := false
@@ -5739,6 +5801,7 @@ func (mw *MainWindow) startReadTimer(msg *email.Message) {
 	mw.logger.Debug("Starting 5-second read timer for message: %s (UID: %d)", msg.Subject, msg.UID)
 
 	// Start 5-second timer
+	mw.readTimerMu.Lock()
 	mw.readTimer = time.AfterFunc(5*time.Second, func() {
 		mw.logger.Debug("5-second timer expired, marking message as read: %s (UID: %d)", msg.Subject, msg.UID)
 
@@ -5757,12 +5820,17 @@ func (mw *MainWindow) startReadTimer(msg *email.Message) {
 		}
 
 		// Clear timer state
+		mw.readTimerMu.Lock()
 		mw.readTimer = nil
+		mw.readTimerMu.Unlock()
 	})
+	mw.readTimerMu.Unlock()
 }
 
 // cancelReadTimer cancels the current read timer if one is active
 func (mw *MainWindow) cancelReadTimer() {
+	mw.readTimerMu.Lock()
+	defer mw.readTimerMu.Unlock()
 	if mw.readTimer != nil {
 		mw.logger.Debug("Cancelling read timer")
 		mw.readTimer.Stop()
@@ -5907,14 +5975,17 @@ func (mw *MainWindow) updateMessageInCache(updatedMessage *email.Message, folder
 		return
 	}
 
-	// Determine which account this message belongs to
+	// Determine which account this message belongs to. Runs on a background
+	// goroutine, so the message list must be read under its mutex.
 	var accountName string
+	mw.messagesMu.RLock()
 	for _, msg := range mw.messages {
 		if msg.Message.UID == updatedMessage.UID {
 			accountName = msg.AccountName
 			break
 		}
 	}
+	mw.messagesMu.RUnlock()
 
 	if accountName == "" {
 		mw.logger.Warn("Could not determine account for message UID %d", updatedMessage.UID)
@@ -6109,7 +6180,7 @@ func (mw *MainWindow) startFolderMonitoring(folder string) {
 					indexItems := mw.convertMessagesToIndexItems(messages, updatedFolder)
 					mw.mergeNewMessagesIntoUnifiedInbox(indexItems)
 					mw.sortMessages()
-					mw.messageList.UnselectAll()
+					mw.clearMessageSelection()
 					mw.refreshMessageList()
 					mw.statusBar.SetText(fmt.Sprintf("New messages in %s (%d)", updatedFolder, len(messages)))
 				})
@@ -6763,12 +6834,16 @@ func (mw *MainWindow) refreshMessagesDebounced(folderName string, callback func(
 
 		// Check if this is the currently selected folder
 		currentFolder := mw.folderController.GetCurrentFolder()
-		if folderName != "" && currentFolder == folderName {
-			// Re-select the current folder to trigger a refresh
-			fyne.Do(func() {
-				mw.selectFolderWithOptions(folderName, true)
-			})
+		if folderName == "" || currentFolder != folderName {
+			// The user moved on to another folder; refreshing would clobber
+			// it. Report the skip so callers' error handling can react.
+			return fmt.Errorf("skipped refresh of %s: folder no longer selected", folderName)
 		}
+
+		// Re-select the current folder to trigger a refresh
+		fyne.Do(func() {
+			mw.selectFolderWithOptions(folderName, true)
+		})
 
 		return nil
 	}, callback)

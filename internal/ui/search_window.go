@@ -233,11 +233,10 @@ func (sw *SearchWindow) performSearch() {
 
 	// Perform search asynchronously to avoid blocking the UI
 	go func() {
-		var results []email.Message
-		var err error
-
 		if sw.imapClient == nil {
-			sw.statusBar.SetText("Error: No IMAP client available")
+			fyne.Do(func() {
+				sw.statusBar.SetText("Error: No IMAP client available")
+			})
 			return
 		}
 
@@ -246,35 +245,43 @@ func (sw *SearchWindow) performSearch() {
 		if criteria.SearchServer {
 			searchType = "server"
 		}
-		sw.statusBar.SetText(fmt.Sprintf("Searching %s...", searchType))
+		fyne.Do(func() {
+			sw.statusBar.SetText(fmt.Sprintf("Searching %s...", searchType))
+		})
 
 		// Perform the search
+		var results []email.Message
+		var err error
 		if criteria.Folder != "" && criteria.Folder != "All Folders" {
 			results, err = sw.imapClient.SearchMessagesInFolder(criteria.Folder, criteria)
 		} else {
 			results, err = sw.imapClient.SearchMessages(criteria)
 		}
 
-		// Update UI on main thread
-		if err != nil {
-			sw.statusBar.SetText(fmt.Sprintf("Search failed: %v", err))
-			return
-		}
-
 		// Sort results by date (newest first)
-		sw.sortResultsByDate(results)
-
-		sw.searchResults = results
-		sw.resultsList.Refresh()
-
-		// Update status with more detailed information
-		if len(results) == 0 {
-			sw.statusBar.SetText("No messages found matching your criteria")
-		} else if len(results) == criteria.MaxResults {
-			sw.statusBar.SetText(fmt.Sprintf("Found %d messages (limited to %d results)", len(results), criteria.MaxResults))
-		} else {
-			sw.statusBar.SetText(fmt.Sprintf("Found %d messages", len(results)))
+		if err == nil {
+			sw.sortResultsByDate(results)
 		}
+
+		// Update UI on main thread
+		fyne.Do(func() {
+			if err != nil {
+				sw.statusBar.SetText(fmt.Sprintf("Search failed: %v", err))
+				return
+			}
+
+			sw.searchResults = results
+			sw.resultsList.Refresh()
+
+			// Update status with more detailed information
+			if len(results) == 0 {
+				sw.statusBar.SetText("No messages found matching your criteria")
+			} else if len(results) == criteria.MaxResults {
+				sw.statusBar.SetText(fmt.Sprintf("Found %d messages (limited to %d results)", len(results), criteria.MaxResults))
+			} else {
+				sw.statusBar.SetText(fmt.Sprintf("Found %d messages", len(results)))
+			}
+		})
 	}()
 }
 
@@ -416,8 +423,10 @@ func (sw *SearchWindow) populateFolderList() {
 		}
 
 		// Update UI on main thread
-		sw.folderSelect.Options = folderNames
-		sw.folderSelect.Refresh()
+		fyne.Do(func() {
+			sw.folderSelect.Options = folderNames
+			sw.folderSelect.Refresh()
+		})
 	}()
 }
 
