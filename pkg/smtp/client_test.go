@@ -1,10 +1,13 @@
 package smtp
 
 import (
+	"bytes"
+	"io"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/emersion/go-message"
 	"github.com/wltechblog/gommail/internal/email"
 )
 
@@ -324,4 +327,105 @@ func TestIsValidEmail(t *testing.T) {
 			t.Errorf("Invalid email %s was marked as valid", email)
 		}
 	}
+}
+
+// TestBuildMessageMIMEStructureWithAttachments verifies the two structural
+// fixes for attachment messages: the body must be a nested
+// multipart/alternative inside multipart/mixed (not siblings), and
+// attachments must be base64-encoded exactly once by go-message (the
+// previous manual encoder on top of go-message's CTE handling corrupted
+// every attachment).
+func TestBuildMessageMIMEStructureWithAttachments(t *testing.T) {
+	c := NewClient(email.ServerConfig{Host: "smtp.example.com", Port: 465, Username: "u@example.com"})
+	attachmentData := []byte("attachment content that must survive exactly")
+	msg := &email.Message{
+		Subject:     "structure probe",
+		From:        []email.Address{{Email: "from@example.com"}},
+		To:          []email.Address{{Email: "to@example.com"}},
+		Body:        email.MessageBody{Text: "plain body", HTML: "<p>html body</p>"},
+		Attachments: []email.Attachment{{Filename: "file.bin", ContentType: "application/octet-stream", Data: attachmentData}},
+	}
+
+	raw, err := c.BuildMessage(msg)
+	if err != nil {
+		t.Fatalf("BuildMessage failed: %v", err)
+	}
+	str := string(raw)
+
+	if !strings.Contains(str, "multipart/mixed") {
+		t.Error("outer structure should be multipart/mixed")
+	}
+	if !strings.Contains(str, "multipart/alternative") {
+		t.Error("text+html body should be nested in multipart/alternative")
+	}
+	if !strings.Contains(str, "plain body") || !strings.Contains(str, "<p>html body</p>") {
+		t.Error("body parts missing from output")
+	}
+
+	// Round-trip through go-message's reader: the attachment must decode
+	// back to the exact original bytes.
+	parsed, err := message.Read(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("failed to parse built message: %v", err)
+	}
+
+	foundAttachment := false
+	err = parsed.Walk(func(path []int, p *message.Entity, err error) error {
+		if strings.HasPrefix(p.Header.Get("Content-Disposition"), "attachment") {
+			foundAttachment = true
+			data, err := io.ReadAll(p.Body)
+			if err != nil {
+				t.Fatalf("failed to read attachment part: %v", err)
+			}
+			if !bytes.Equal(data, attachmentData) {
+				t.Errorf("attachment decoded to %q, want %q (double encoding?)", data, attachmentData)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk failed: %v", err)
+	}
+	if !foundAttachment {
+		t.Error("no attachment part found in built message")
+	}
+}
+
+func TestBuildMessageHeadersDateAndMessageID(t *testing.T) {
+	c := NewClient(email.ServerConfig{Host: "smtp.example.com", Port: 465})
+
+	// Zero date must not serialize as year 0001.
+	raw, err := c.BuildMessage(&email.Message{
+		Subject: "header probe",
+		From:    []email.Address{{Email: "from@example.com"}},
+		To:      []email.Address{{Email: "to@example.com"}},
+		Body:    email.MessageBody{Text: "hi"},
+	})
+	if err != nil {
+		t.Fatalf("BuildMessage failed: %v", err)
+	}
+	str := string(raw)
+	if strings.Contains(str, "Jan 0001") {
+		t.Error("zero Date serialized as year 0001")
+	}
+	if !strings.Contains(strings.ToLower(str), "message-id: <") {
+		t.Error("no Message-ID generated")
+	}
+
+	// An explicit Message-ID header must be preserved.
+	explicit := "<custom@example.com>"
+	raw, err = c.BuildMessage(&email.Message{
+		Subject: "header probe 2",
+		From:    []email.Address{{Email: "from@example.com"}},
+		To:      []email.Address{{Email: "to@example.com"}},
+		Body:    email.MessageBody{Text: "hi"},
+		Headers: map[string]string{"Message-ID": explicit},
+	})
+	if err != nil {
+		t.Fatalf("BuildMessage failed: %v", err)
+	}
+	if !strings.Contains(string(raw), explicit) {
+		t.Error("explicit Message-ID header not preserved")
+	}
+
 }

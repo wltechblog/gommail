@@ -2,11 +2,14 @@ package smtp
 
 import (
 	"bytes"
+	crand "crypto/rand"
 	"crypto/tls"
-	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"mime"
+	"net"
 	"net/smtp"
 	"path/filepath"
 	"strings"
@@ -63,6 +66,13 @@ func (c *Client) Disconnect() error {
 	// No persistent connection to close
 	return nil
 }
+
+// SMTP operation timeouts. Without them a stalled server hangs the sending
+// goroutine (and any UI waiting on it) indefinitely.
+const (
+	smtpDialTimeout = 30 * time.Second
+	smtpDataTimeout = 5 * time.Minute
+)
 
 // SendMessage sends an email message via SMTP
 func (c *Client) SendMessage(msg *email.Message) error {
@@ -126,7 +136,7 @@ func (c *Client) SendMessage(msg *email.Message) error {
 	} else {
 		// Use plain connection with STARTTLS
 		c.logger.Debug("Using STARTTLS connection")
-		sendErr = smtp.SendMail(addr, auth, sender, recipients, emailContent)
+		sendErr = c.sendWithSTARTTLS(addr, auth, sender, recipients, emailContent)
 	}
 
 	if sendErr != nil {
@@ -138,18 +148,62 @@ func (c *Client) SendMessage(msg *email.Message) error {
 	return nil
 }
 
-// sendWithTLS sends email using direct TLS connection
-func (c *Client) sendWithTLS(addr string, auth smtp.Auth, from string, to []string, msg []byte) error {
-	// Connect with TLS
-	conn, err := tls.Dial("tcp", addr, &tls.Config{
-		ServerName: c.config.Host,
-	})
+// dial connects to the SMTP server with a dial timeout, returning a plain
+// TCP connection ready for TLS handshake or STARTTLS negotiation.
+func (c *Client) dial(addr string) (net.Conn, error) {
+	conn, err := net.DialTimeout("tcp", addr, smtpDialTimeout)
 	if err != nil {
-		return fmt.Errorf("failed to connect with TLS: %w", err)
+		return nil, fmt.Errorf("failed to connect to %s: %w", addr, err)
+	}
+	if err := conn.SetDeadline(time.Now().Add(smtpDataTimeout)); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to set deadline: %w", err)
+	}
+	return conn, nil
+}
+
+// sendWithTLS sends email using a direct TLS connection (port 465)
+func (c *Client) sendWithTLS(addr string, auth smtp.Auth, from string, to []string, msg []byte) error {
+	rawConn, err := c.dial(addr)
+	if err != nil {
+		return err
+	}
+	conn := tls.Client(rawConn, &tls.Config{ServerName: c.config.Host})
+	if err := conn.Handshake(); err != nil {
+		rawConn.Close()
+		return fmt.Errorf("TLS handshake failed: %w", err)
+	}
+	defer conn.Close()
+	return c.sendOnConn(conn, auth, from, to, msg)
+}
+
+// sendWithSTARTTLS sends email over a plain connection upgraded with STARTTLS.
+// It replaces net/smtp.SendMail, which performs every network operation
+// without any timeout.
+func (c *Client) sendWithSTARTTLS(addr string, auth smtp.Auth, from string, to []string, msg []byte) error {
+	conn, err := c.dial(addr)
+	if err != nil {
+		return err
 	}
 	defer conn.Close()
 
-	// Create SMTP client
+	client, err := smtp.NewClient(conn, c.config.Host)
+	if err != nil {
+		return fmt.Errorf("failed to create SMTP client: %w", err)
+	}
+	defer client.Quit()
+
+	if ok, _ := client.Extension("STARTTLS"); ok {
+		if err := client.StartTLS(&tls.Config{ServerName: c.config.Host}); err != nil {
+			return fmt.Errorf("STARTTLS failed: %w", err)
+		}
+	}
+	return c.sendOnConn(conn, auth, from, to, msg)
+}
+
+// sendOnConn performs the authenticated MAIL/RCPT/DATA exchange on an
+// established connection.
+func (c *Client) sendOnConn(conn net.Conn, auth smtp.Auth, from string, to []string, msg []byte) error {
 	client, err := smtp.NewClient(conn, c.config.Host)
 	if err != nil {
 		return fmt.Errorf("failed to create SMTP client: %w", err)
@@ -201,8 +255,17 @@ func (c *Client) buildMessage(msg *email.Message) ([]byte, error) {
 
 	// Create message header
 	var h message.Header
-	h.Set("Date", msg.Date.Format(time.RFC1123Z))
+	if msg.Date.IsZero() {
+		// A zero Date formats as "Mon, 01 Jan 0001" which some servers and
+		// clients reject; stamp the send time instead.
+		h.Set("Date", time.Now().Format(time.RFC1123Z))
+	} else {
+		h.Set("Date", msg.Date.Format(time.RFC1123Z))
+	}
 	h.Set("Subject", msg.Subject)
+	if msg.Headers["Message-ID"] == "" {
+		h.Set("Message-ID", c.generateMessageID(msg))
+	}
 
 	// Set addresses
 	if len(msg.From) > 0 {
@@ -276,32 +339,31 @@ func (c *Client) formatAddresses(addresses []email.Address) string {
 	return strings.Join(formatted, ", ")
 }
 
-// writeMultipartWithAttachments writes a multipart/mixed message with attachments
-func (c *Client) writeMultipartWithAttachments(mw *message.Writer, msg *email.Message) error {
-	// The message writer should already be set up for multipart/mixed
-	// Write message body part first
-	if msg.Body.HTML != "" && msg.Body.Text != "" {
-		var textHeader message.Header
-		textHeader.Set("Content-Type", "text/plain; charset=utf-8")
-		textPart, err := mw.CreatePart(textHeader)
-		if err != nil {
-			return err
+// generateMessageID creates a globally unique message ID of the form
+// <timestamp-random@domain>. Uniqueness (not unpredictability) is the goal.
+func (c *Client) generateMessageID(msg *email.Message) string {
+	var randPart [8]byte
+	if _, err := crand.Read(randPart[:]); err != nil {
+		// Fall back to a counter-free combination; still unique per send.
+		binary.BigEndian.PutUint64(randPart[:], uint64(time.Now().UnixNano()))
+	}
+	domain := "localhost"
+	if len(msg.From) > 0 {
+		if at := strings.LastIndex(msg.From[0].Email, "@"); at >= 0 {
+			domain = msg.From[0].Email[at+1:]
 		}
-		_, err = io.WriteString(textPart, msg.Body.Text)
-		textPart.Close()
-		if err != nil {
-			return err
-		}
+	} else if at := strings.LastIndex(c.config.Username, "@"); at >= 0 {
+		domain = c.config.Username[at+1:]
+	}
+	return fmt.Sprintf("<%d-%s@%s>", time.Now().UnixNano(), hex.EncodeToString(randPart[:]), domain)
+}
 
-		var htmlHeader message.Header
-		htmlHeader.Set("Content-Type", "text/html; charset=utf-8")
-		htmlPart, err := mw.CreatePart(htmlHeader)
-		if err != nil {
-			return err
-		}
-		_, err = io.WriteString(htmlPart, msg.Body.HTML)
-		htmlPart.Close()
-		if err != nil {
+// writeMultipartWithAttachments writes a multipart/mixed message: the body
+// first (nested in multipart/alternative when both plain text and HTML are
+// present, as RFC 2046 requires), followed by one part per attachment.
+func (c *Client) writeMultipartWithAttachments(mw *message.Writer, msg *email.Message) error {
+	if msg.Body.HTML != "" && msg.Body.Text != "" {
+		if err := c.writeMultipartAlternative(mw, msg); err != nil {
 			return err
 		}
 	} else {
@@ -398,7 +460,9 @@ func (c *Client) writeSinglePart(mw *message.Writer, msg *email.Message) error {
 	return err
 }
 
-// writeAttachment writes an attachment to the message
+// writeAttachment writes an attachment to the message. go-message performs
+// the base64 transfer encoding itself based on the Content-Transfer-Encoding
+// header (wrapping lines at 76 characters); the data must be written raw.
 func (c *Client) writeAttachment(mw *message.Writer, attachment email.Attachment) error {
 	var h message.Header
 
@@ -421,11 +485,7 @@ func (c *Client) writeAttachment(mw *message.Writer, attachment email.Attachment
 	}
 	defer part.Close()
 
-	// Encode attachment data as base64
-	encoder := base64.NewEncoder(base64.StdEncoding, part)
-	defer encoder.Close()
-
-	_, err = encoder.Write(attachment.Data)
+	_, err = part.Write(attachment.Data)
 	return err
 }
 
