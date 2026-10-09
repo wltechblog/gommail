@@ -526,3 +526,51 @@ Content-Transfer-Encoding: quoted-printable
 		t.Errorf("HTML content does not contain properly decoded links: %s", msg.Body.HTML)
 	}
 }
+
+func TestAttachmentSizeLimitDoesNotBufferOversize(t *testing.T) {
+	p := NewMessageProcessor()
+	p.MaxAttachmentSize = 1024
+
+	big := strings.Repeat("x", 10*1024*1024)
+	err := p.parseAttachmentWithEncoding(strings.NewReader(big), "application/octet-stream", "", "big.bin", &Message{})
+	if err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("expected size-limit error, got %v", err)
+	}
+
+	// Exactly at the limit must still pass.
+	msg := &Message{}
+	exact := strings.Repeat("x", 1024)
+	if err := p.parseAttachmentWithEncoding(strings.NewReader(exact), "application/octet-stream", "", "exact.bin", msg); err != nil {
+		t.Fatalf("exactly-max attachment rejected: %v", err)
+	}
+	if len(msg.Attachments) != 1 || msg.Attachments[0].Size != 1024 {
+		t.Fatalf("attachment not stored correctly: %+v", msg.Attachments)
+	}
+}
+
+func TestSanitizeHTMLFallbackOnParseFailure(t *testing.T) {
+	p := NewMessageProcessor()
+
+	// Malformed input that goquery still parses is handled by the DOM path;
+	// feed a payload that exercises the javascript: scheme check.
+	dangerous := `<a href="JaVaScRiPt:alert(1)">x</a><a href="https://ok.example">y</a>`
+	got := p.sanitizeHTML(dangerous)
+	if strings.Contains(strings.ToLower(got), "javascript:") {
+		t.Errorf("case-mixed javascript: href survived: %s", got)
+	}
+	if !strings.Contains(got, "https://ok.example") {
+		t.Errorf("safe href removed: %s", got)
+	}
+}
+
+func TestStripDangerousHTMLRegex(t *testing.T) {
+	in := `<div onclick="evil()">a<script>alert(1)</script>b</div><a href="javascript:x">c</a>`
+	got := stripDangerousHTMLRegex(in)
+	lower := strings.ToLower(got)
+	if strings.Contains(lower, "<script") || strings.Contains(lower, "onclick") || strings.Contains(lower, "javascript:") {
+		t.Errorf("regex fallback left dangerous content: %s", got)
+	}
+	if !strings.Contains(got, "a") || !strings.Contains(got, "b") {
+		t.Errorf("regex fallback dropped benign text: %s", got)
+	}
+}

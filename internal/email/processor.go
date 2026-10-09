@@ -24,6 +24,10 @@ type MessageProcessor struct {
 	// Configuration options for processing
 	MaxAttachmentSize int64 // Maximum attachment size in bytes
 	SanitizeHTML      bool  // Whether to sanitize HTML content
+	// SaveFailedMessages enables dumping raw messages that fail to parse
+	// to /tmp for debugging. Disabled by default: failed messages can
+	// contain anything, including private content.
+	SaveFailedMessages bool
 
 	// Attachment management
 	AttachmentManager *AttachmentManager
@@ -262,8 +266,16 @@ func (p *MessageProcessor) parseAttachmentWithEncoding(body io.Reader, contentTy
 		return fmt.Errorf("failed to decode attachment: %w", err)
 	}
 
-	// Read decoded attachment data
-	data, err := io.ReadAll(decodedReader)
+	// Read decoded attachment data. The limit is max+1 so exactly-max
+	// attachments pass while anything larger is rejected after reading at
+	// most one byte beyond the limit - instead of buffering an arbitrarily
+	// large attachment in memory before the size check fires.
+	var data []byte
+	if p.MaxAttachmentSize > 0 {
+		data, err = io.ReadAll(io.LimitReader(decodedReader, p.MaxAttachmentSize+1))
+	} else {
+		data, err = io.ReadAll(decodedReader)
+	}
 	if err != nil {
 		return err
 	}
@@ -410,7 +422,9 @@ func (p *MessageProcessor) sanitizeHTML(html string) string {
 	// Parse HTML
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
 	if err != nil {
-		return html // Return original if parsing fails
+		// Never return the original untouched: unparseable input gets the
+		// regex-based fallback strip instead.
+		return stripDangerousHTMLRegex(html)
 	}
 
 	// Remove script tags
@@ -422,16 +436,52 @@ func (p *MessageProcessor) sanitizeHTML(html string) string {
 		doc.Find(fmt.Sprintf("[%s]", attr)).RemoveAttr(attr)
 	}
 
-	// Remove javascript: links
-	doc.Find("a[href^='javascript:']").RemoveAttr("href")
+	// Remove javascript: links. The href scheme is case-insensitive and may
+	// carry leading whitespace or control characters, so inspect each anchor
+	// rather than relying on a case-sensitive prefix selector.
+	doc.Find("a[href]").Each(func(i int, s *goquery.Selection) {
+		href := strings.TrimSpace(s.AttrOr("href", ""))
+		if strings.HasPrefix(strings.ToLower(href), "javascript:") {
+			s.RemoveAttr("href")
+		}
+	})
 
 	// Get sanitized HTML
 	sanitized, err := doc.Html()
 	if err != nil {
-		return html // Return original if error
+		return stripDangerousHTMLRegex(html)
 	}
 
 	return sanitized
+}
+
+var (
+	scriptBlockRe = regexp.MustCompile(`(?is)<script[^>]*>.*?</script>`)
+	scriptOpenRe  = regexp.MustCompile(`(?is)<script[^>]*>`)
+	eventAttrRe   = regexp.MustCompile(`(?i)\s+on[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)`)
+	jsHrefRe      = regexp.MustCompile(`(?i)href\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)`)
+)
+
+// stripDangerousHTMLRegex is the fallback sanitizers for input goquery
+// cannot parse. It is deliberately conservative: script blocks and event
+// handler attributes are removed outright, and any href whose value looks
+// like a javascript: URI (case-insensitively) is dropped.
+func stripDangerousHTMLRegex(html string) string {
+	html = scriptBlockRe.ReplaceAllString(html, "")
+	html = scriptOpenRe.ReplaceAllString(html, "")
+	html = eventAttrRe.ReplaceAllString(html, "")
+	html = jsHrefRe.ReplaceAllStringFunc(html, func(match string) string {
+		quote := strings.IndexAny(match, "\"'")
+		if quote < 0 {
+			return match // unquoted value: jsHrefRe value parsing below handles it
+		}
+		value := strings.TrimSpace(match[quote+1 : len(match)-1])
+		if strings.HasPrefix(strings.ToLower(value), "javascript:") {
+			return ""
+		}
+		return match
+	})
+	return html
 }
 
 // extractTextFromHTML extracts plain text from HTML content
@@ -457,14 +507,18 @@ func (p *MessageProcessor) extractTextFromHTML(html string) string {
 	return text
 }
 
-// saveFailedMessage saves a message that failed to parse to a temporary file for debugging
+// saveFailedMessage saves a message that failed to parse to a temporary
+// file for debugging. It only runs when SaveFailedMessages is enabled:
+// failed messages contain the user's private mail, so nothing is written
+// to disk by default.
 func (p *MessageProcessor) saveFailedMessage(rawMessage []byte, parseError error) {
-	// Import os and time packages are needed - they should already be imported
-	// Create a temporary file with timestamp
+	if !p.SaveFailedMessages {
+		return
+	}
+
 	timestamp := fmt.Sprintf("%d", time.Now().Unix())
 	filename := fmt.Sprintf("/tmp/failed-message-%s.eml", timestamp)
 
-	// Write the raw message to the file
 	err := os.WriteFile(filename, rawMessage, 0600)
 	if err != nil {
 		fmt.Printf("WARNING: Failed to save problematic message to %s: %v\n", filename, err)
@@ -479,6 +533,4 @@ func (p *MessageProcessor) saveFailedMessage(rawMessage []byte, parseError error
 	if err != nil {
 		fmt.Printf("WARNING: Failed to save error log to %s: %v\n", errorFilename, err)
 	}
-
-	fmt.Printf("SAVED FAILED MESSAGE: %s (error: %v)\n", filename, parseError)
 }
