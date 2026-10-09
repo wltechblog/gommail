@@ -426,9 +426,8 @@ func (w *ClientWrapper) FetchMessages(folder string, limit int) ([]email.Message
 		return nil, fmt.Errorf("invalid response data for messages")
 	}
 
-	// Cache the fetched messages
-	w.cacheMessages(folder, messages)
-
+	// The worker caches the fetched messages itself; re-caching here would
+	// marshal and write the same (potentially large) payload a second time.
 	return messages, nil
 }
 
@@ -660,7 +659,7 @@ func (w *ClientWrapper) GetCachedMessages(folder string) ([]email.Message, bool,
 		return nil, false, nil // No cache available
 	}
 
-	key := w.getCacheKey("messages", folder)
+	key := w.cacheKeyFor("messages", folder)
 	data, found, err := w.cache.Get(key)
 	if err != nil || !found {
 		return nil, false, err
@@ -886,23 +885,3 @@ func (w *ClientWrapper) SetReconnectConfig(delay, maxDelay time.Duration, maxAtt
 	w.worker.SetReconnectConfig(delay, maxDelay, maxAttempts)
 }
 
-// getCacheKey generates a cache key for the given type and identifier
-// Deprecated: Use cache.GenerateAccountKey instead
-func (w *ClientWrapper) getCacheKey(keyType, identifier string) string {
-	return cache.GenerateAccountKey(w.accountKey, keyType, identifier)
-}
-
-// cacheMessages stores messages in cache
-func (w *ClientWrapper) cacheMessages(folder string, messages []email.Message) error {
-	if w.cache == nil {
-		return nil // No cache available
-	}
-
-	data, err := json.Marshal(messages)
-	if err != nil {
-		return fmt.Errorf("failed to marshal messages: %w", err)
-	}
-
-	key := w.getCacheKey("messages", folder)
-	return w.cache.Set(key, data, 24*time.Hour) // Cache messages for 24 hours
-}
