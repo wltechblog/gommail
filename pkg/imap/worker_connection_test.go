@@ -87,4 +87,3 @@ func TestIsConnectionError(t *testing.T) {
 		})
 	}
 }
-

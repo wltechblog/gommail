@@ -130,4 +130,3 @@ func (d *CallbackDebouncer) Stop() {
 	}
 	d.callbacks = make([]func(error), 0)
 }
-

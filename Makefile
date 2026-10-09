@@ -1,4 +1,4 @@
-.PHONY: all build run test clean install deps fmt vet lint
+.PHONY: all build run test test-race clean install deps fmt vet lint
 
 # Build variables
 BINARY_NAME=gommail
@@ -34,6 +34,11 @@ run: build
 test:
 	@echo "Running tests..."
 	$(GOTEST) -v ./...
+
+# Run tests with the race detector
+test-race:
+	@echo "Running tests with race detector..."
+	$(GOTEST) -race ./...
 
 # Run tests with coverage (excluding debug tools)
 test-coverage:

@@ -13,10 +13,9 @@ type ConnectionEvent = email.ConnectionEvent
 
 // Connection state constants
 const (
-	ConnectionStateDisconnected  = email.ConnectionStateDisconnected
-	ConnectionStateConnecting    = email.ConnectionStateConnecting
-	ConnectionStateConnected     = email.ConnectionStateConnected
-	ConnectionStateReconnecting  = email.ConnectionStateReconnecting
-	ConnectionStateFailed        = email.ConnectionStateFailed
+	ConnectionStateDisconnected = email.ConnectionStateDisconnected
+	ConnectionStateConnecting   = email.ConnectionStateConnecting
+	ConnectionStateConnected    = email.ConnectionStateConnected
+	ConnectionStateReconnecting = email.ConnectionStateReconnecting
+	ConnectionStateFailed       = email.ConnectionStateFailed
 )
-

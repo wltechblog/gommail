@@ -316,4 +316,3 @@ func BenchmarkParseKey(b *testing.B) {
 		ParseKey(key)
 	}
 }
-

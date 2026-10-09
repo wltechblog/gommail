@@ -62,7 +62,7 @@ type IMAPWorker struct {
 	lastMessageCount map[string]uint32
 	lastHighestUID   map[string]uint32
 	initialSyncDone  map[string]bool
-	lastIDLEActivity time.Time    // Track last time IDLE loop was confirmed running
+	lastIDLEActivity time.Time     // Track last time IDLE loop was confirmed running
 	idleUpdateCh     chan struct{} // Signalled by UnilateralDataHandler when server pushes a mailbox update
 
 	// New-message retry state: a UID change was observed but the message was
@@ -136,12 +136,12 @@ const (
 // NewIMAPWorker creates a new IMAP worker for the specified account
 func NewIMAPWorker(config *email.ServerConfig, accountName, cacheKey string, cache *cache.Cache) *IMAPWorker {
 	worker := &IMAPWorker{
-		config:      config,
-		accountName: accountName,
-		cacheKey:    cacheKey,
-		cache:       cache,
-		commandCh:   make(chan *IMAPCommand, DefaultCommandChBuffer),
-		fetchCh:     make(chan *IMAPCommand, DefaultCommandChBuffer),
+		config:       config,
+		accountName:  accountName,
+		cacheKey:     cacheKey,
+		cache:        cache,
+		commandCh:    make(chan *IMAPCommand, DefaultCommandChBuffer),
+		fetchCh:      make(chan *IMAPCommand, DefaultCommandChBuffer),
 		idleUpdateCh: make(chan struct{}, 1),
 		// stopCh and ctx will be created in Start()
 		state:                ConnectionStateDisconnected,
@@ -2345,27 +2345,27 @@ func (w *IMAPWorker) checkForNewMessages(folder string) {
 			w.mu.Unlock()
 			go w.saveTrackingStateToCache()
 
-		w.mu.RLock()
-		callback := w.onNewMessage
-		w.mu.RUnlock()
+			w.mu.RLock()
+			callback := w.onNewMessage
+			w.mu.RUnlock()
 
-		if callback != nil {
-			maxNotifications := MaxNewMessageNotifications
-			notificationMessages := newMessages
-			if len(newMessages) > maxNotifications {
-				w.logger.Warn("Limiting notifications to %d messages (found %d new messages) to prevent spam",
-					maxNotifications, len(newMessages))
-				notificationMessages = newMessages[:maxNotifications]
-			}
+			if callback != nil {
+				maxNotifications := MaxNewMessageNotifications
+				notificationMessages := newMessages
+				if len(newMessages) > maxNotifications {
+					w.logger.Warn("Limiting notifications to %d messages (found %d new messages) to prevent spam",
+						maxNotifications, len(newMessages))
+					notificationMessages = newMessages[:maxNotifications]
+				}
 
-			event := NewMessageEvent{
-				Folder:    folder,
-				Messages:  notificationMessages,
-				Count:     len(notificationMessages),
-				Timestamp: time.Now(),
+				event := NewMessageEvent{
+					Folder:    folder,
+					Messages:  notificationMessages,
+					Count:     len(notificationMessages),
+					Timestamp: time.Now(),
+				}
+				callback(event)
 			}
-			callback(event)
-		}
 		} else if currentHighestUID > lastUID {
 			// fetchNewMessages returned nothing despite a UID change. This typically
 			// means the server sent EXISTS before the message was fully delivered.

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/smtp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -191,7 +192,7 @@ func (v *ServerValidator) ValidateSMTPServer(config email.ServerConfig) (*Server
 
 // testIMAPTLS tests IMAP connection with direct TLS
 func (v *ServerValidator) testIMAPTLS(config *email.ServerConfig, result *ServerValidationResult) error {
-	addr := fmt.Sprintf("%s:%d", config.Host, config.Port)
+	addr := net.JoinHostPort(config.Host, strconv.Itoa(config.Port))
 
 	// First, validate the certificate by making a direct TLS connection
 	if err := v.validateTLSCertificate(config.Host, config.Port, result); err != nil {
@@ -228,7 +229,7 @@ func (v *ServerValidator) testIMAPTLS(config *email.ServerConfig, result *Server
 
 // testIMAPSTARTTLS tests IMAP connection with STARTTLS
 func (v *ServerValidator) testIMAPSTARTTLS(config *email.ServerConfig, result *ServerValidationResult) error {
-	addr := fmt.Sprintf("%s:%d", config.Host, config.Port)
+	addr := net.JoinHostPort(config.Host, strconv.Itoa(config.Port))
 
 	// For STARTTLS, we need to validate the certificate after the STARTTLS upgrade
 	// Since go-imap/v2 doesn't expose the TLS connection, we'll do a separate validation
@@ -269,7 +270,7 @@ func (v *ServerValidator) testIMAPSTARTTLS(config *email.ServerConfig, result *S
 
 // testIMAPPlain tests IMAP connection without encryption (plain text)
 func (v *ServerValidator) testIMAPPlain(config *email.ServerConfig, result *ServerValidationResult) error {
-	addr := fmt.Sprintf("%s:%d", config.Host, config.Port)
+	addr := net.JoinHostPort(config.Host, strconv.Itoa(config.Port))
 
 	// Connect without TLS
 	conn, err := net.DialTimeout("tcp", addr, v.timeout)
@@ -296,7 +297,7 @@ func (v *ServerValidator) testIMAPPlain(config *email.ServerConfig, result *Serv
 
 // testSMTPTLS tests SMTP connection with direct TLS
 func (v *ServerValidator) testSMTPTLS(config *email.ServerConfig, result *ServerValidationResult) error {
-	addr := fmt.Sprintf("%s:%d", config.Host, config.Port)
+	addr := net.JoinHostPort(config.Host, strconv.Itoa(config.Port))
 
 	tlsConfig := &tls.Config{
 		ServerName:         config.Host,
@@ -337,7 +338,7 @@ func (v *ServerValidator) testSMTPTLS(config *email.ServerConfig, result *Server
 
 // testSMTPSTARTTLS tests SMTP connection with STARTTLS
 func (v *ServerValidator) testSMTPSTARTTLS(config *email.ServerConfig, result *ServerValidationResult) error {
-	addr := fmt.Sprintf("%s:%d", config.Host, config.Port)
+	addr := net.JoinHostPort(config.Host, strconv.Itoa(config.Port))
 
 	// Connect to server
 	conn, err := net.DialTimeout("tcp", addr, v.timeout)
@@ -386,7 +387,7 @@ func (v *ServerValidator) testSMTPSTARTTLS(config *email.ServerConfig, result *S
 
 // testSMTPPlain tests SMTP connection without encryption (plain text)
 func (v *ServerValidator) testSMTPPlain(config *email.ServerConfig, result *ServerValidationResult) error {
-	addr := fmt.Sprintf("%s:%d", config.Host, config.Port)
+	addr := net.JoinHostPort(config.Host, strconv.Itoa(config.Port))
 
 	// Connect without TLS
 	conn, err := net.DialTimeout("tcp", addr, v.timeout)
@@ -606,7 +607,7 @@ func (v *ServerValidator) isValidHostnameAndSameIP(host1, host2 string) bool {
 
 // validateTLSCertificate validates the TLS certificate for a direct TLS connection
 func (v *ServerValidator) validateTLSCertificate(host string, port int, result *ServerValidationResult) error {
-	addr := fmt.Sprintf("%s:%d", host, port)
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
 
 	// Connect with TLS to get certificate information
 	dialer := &net.Dialer{Timeout: v.timeout}
@@ -626,7 +627,7 @@ func (v *ServerValidator) validateTLSCertificate(host string, port int, result *
 
 // validateSTARTTLSCertificate validates the certificate for a STARTTLS connection
 func (v *ServerValidator) validateSTARTTLSCertificate(host string, port int, protocol string, result *ServerValidationResult) error {
-	addr := fmt.Sprintf("%s:%d", host, port)
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
 
 	if protocol == "smtp" {
 		return v.validateSMTPSTARTTLSCertificate(addr, host, result)
@@ -643,7 +644,7 @@ func (v *ServerValidator) ValidateServerCertificate(host string, port int) (*Ser
 		CertificateIssues: []string{},
 	}
 
-	addr := fmt.Sprintf("%s:%d", host, port)
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
 
 	// Connect with TLS to get certificate information
 	dialer := &net.Dialer{Timeout: v.timeout}

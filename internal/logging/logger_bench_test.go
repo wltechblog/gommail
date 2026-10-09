@@ -108,4 +108,3 @@ func BenchmarkLogger_ParallelFiltered(b *testing.B) {
 		}
 	})
 }
-

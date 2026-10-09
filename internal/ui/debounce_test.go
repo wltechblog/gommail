@@ -243,4 +243,3 @@ func TestCallbackDebouncer_ConcurrentCallbacks(t *testing.T) {
 		t.Errorf("Expected all 50 callbacks to be called, got %d calls", count)
 	}
 }
-

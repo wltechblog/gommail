@@ -298,7 +298,7 @@ func TestNewFolderSubscriptionDialog(t *testing.T) {
 
 func TestFolderSubscriptionDialog_IsFolderSubscribed(t *testing.T) {
 	app := test.NewApp()
-	
+
 	mockClient := NewMockFolderIMAPClient()
 	logger := logging.NewComponent("test")
 
@@ -340,7 +340,7 @@ func TestFolderSubscriptionDialog_IsFolderSubscribed(t *testing.T) {
 
 func TestFolderSubscriptionDialog_SubscribeUnsubscribe(t *testing.T) {
 	app := test.NewApp()
-	
+
 	mockClient := NewMockFolderIMAPClient()
 	logger := logging.NewComponent("test")
 
@@ -377,7 +377,7 @@ func TestFolderSubscriptionDialog_SubscribeUnsubscribe(t *testing.T) {
 
 func TestFolderSubscriptionDialog_RefreshFolders(t *testing.T) {
 	app := test.NewApp()
-	
+
 	mockClient := NewMockFolderIMAPClient()
 	logger := logging.NewComponent("test")
 
@@ -409,7 +409,7 @@ func TestFolderSubscriptionDialog_RefreshFolders(t *testing.T) {
 
 func TestFolderSubscriptionDialog_OnCloseCallback(t *testing.T) {
 	app := test.NewApp()
-	
+
 	mockClient := NewMockFolderIMAPClient()
 	logger := logging.NewComponent("test")
 
@@ -439,7 +439,7 @@ func TestFolderSubscriptionDialog_OnCloseCallback(t *testing.T) {
 
 func TestFolderSubscriptionDialog_CreateFolder(t *testing.T) {
 	app := test.NewApp()
-	
+
 	mockClient := NewMockFolderIMAPClient()
 	logger := logging.NewComponent("test")
 
@@ -501,7 +501,7 @@ func TestFolderSubscriptionDialog_CreateFolder(t *testing.T) {
 
 func TestFolderSubscriptionDialog_CreateFolderCallsCallback(t *testing.T) {
 	app := test.NewApp()
-	
+
 	mockClient := NewMockFolderIMAPClient()
 	logger := logging.NewComponent("test")
 
