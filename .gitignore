@@ -71,3 +71,8 @@ mail-test
 /gommail
 error.txt
 .zencoder
+
+# Local diagnostics and tooling state
+dump.txt
+log.txt
+.zcode/
