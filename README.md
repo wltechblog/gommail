@@ -9,9 +9,9 @@ Cross-platform IMAP/SMTP desktop email client for people who want a native Go + 
 
 ## Highlights
 - **Unified Inbox** spanning every configured account with real-time updates
-- **Safe Message Viewer** that sanitizes HTML, converts inline images, and falls back to plaintext automatically
-- **Robust IMAP Worker** with IDLE, resumable fetches, caching, and automatic recovery after network hiccups
-- **Full SMTP Composer** with attachments, drafts, and per-account sender identities
+- **Safe Message Viewer** that sanitizes HTML, converts inline images, falls back to plaintext automatically, and supports selecting and copying message text
+- **Robust IMAP Worker** with IDLE, resumable fetches, caching, size-bounded cache eviction, and automatic recovery after network hiccups
+- **Full SMTP Composer** with attachments (conformant multipart MIME), drafts, and per-account sender identities
 - **Desktop UX** built on Fyne with three-pane layout, keyboard shortcuts, notifications, and a first-run wizard
 
 ## Requirements
@@ -49,6 +49,7 @@ The compiled binary is emitted to `build/gommail`. You can pass flags directly:
 - Multi-account account controller with live folder monitoring and manual refresh controls
 - Unified message list with configurable sorting, unread highlighting, and per-row context menus
 - Debounced message viewer that renders markdown, strips hostile CSS/JS, and displays inline attachments as placeholders
+- Selectable message text in the viewer: drag to select, copy with Ctrl+C or the right-click menu, and copy a whole message (full untruncated body) when nothing is selected. Requires `RichText.Selectable`, so go.mod pins the Fyne develop build that introduced it; switch to the v2.9 tag once released
 - Attachment manager with caching so frequently opened files stay available offline
 - Structured logging and optional IMAP trace files to troubleshoot connectivity
 - Desktop notifications per message with per-account branding assets
@@ -56,7 +57,6 @@ The compiled binary is emitted to `build/gommail`. You can pass flags directly:
 ## Known Limitations
 - OAuth2 and modern web auth flows are not implemented yet
 - Message threading is basic (chronological view only)
-- Fyne doesn't curently support text selection within the RichText widget, so copying message bodies is not supported in the viewer (you can copy from a reply!)
 
 ## Contributing
 Bug reports and pull requests are welcome. Please run `make test` before submitting changes to keep the build healthy.
