@@ -63,4 +63,3 @@ func GenerateAttachmentKey(attachmentID string) string {
 func GenerateAttachmentMetaKey(attachmentID string) string {
 	return fmt.Sprintf("%s:%s", KeyTypeAttachmentMeta, attachmentID)
 }
-

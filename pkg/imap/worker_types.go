@@ -51,13 +51,8 @@ const (
 	CmdCheckNewMessages CommandType = "check_new_messages"
 
 	// Cache commands
-	CmdGetCachedMessages               CommandType = "get_cached_messages"
-	CmdCleanupUnsubscribedFolderCache  CommandType = "cleanup_unsubscribed_folder_cache"
-	CmdInvalidateFolderCache           CommandType = "invalidate_folder_cache"
-	CmdInvalidateSubscribedFolderCache CommandType = "invalidate_subscribed_folder_cache"
-	CmdInvalidateMessageCache          CommandType = "invalidate_message_cache"
-	CmdForceDisconnect                 CommandType = "force_disconnect"
-	CmdRefreshFoldersInBackground      CommandType = "refresh_folders_in_background"
+	CmdGetCachedMessages          CommandType = "get_cached_messages"
+	CmdRefreshFoldersInBackground CommandType = "refresh_folders_in_background"
 )
 
 // Note: ConnectionState is defined in client.go

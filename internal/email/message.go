@@ -285,7 +285,6 @@ type IMAPClient interface {
 	GetHealthStatus() map[string]interface{}
 	SetHealthCheckInterval(interval time.Duration)
 	SetReconnectConfig(initialDelay, maxDelay time.Duration, maxAttempts int)
-	ForceDisconnect()
 	RefreshFoldersInBackground()
 }
 

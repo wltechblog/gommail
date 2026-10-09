@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/wltechblog/gommail/internal/logging"
@@ -24,7 +25,17 @@ type Cache struct {
 	compression bool
 	maxSizeMB   int
 	logger      *logging.Logger
+
+	// writtenSinceCleanup counts bytes written since the last size check;
+	// once it exceeds cleanupCheckBytes a Cleanup runs asynchronously so
+	// the configured maxSizeMB is actually enforced.
+	writtenSinceCleanup int64
+	cleanupPending      atomic.Bool
 }
+
+// cleanupCheckBytes is how much data must be written before the cache
+// re-checks its size limit in the background.
+const cleanupCheckBytes = 32 * 1024 * 1024
 
 // CacheEntry represents a cached item with metadata
 type CacheEntry struct {
@@ -110,7 +121,28 @@ func (c *Cache) Set(key string, data []byte, expiration time.Duration) error {
 
 	c.logger.Debug("Cache entry stored successfully: key=%s, file=%s, size=%d bytes",
 		key, filename, len(entryData))
+
+	// Enforce the size limit periodically rather than never: without this
+	// the cache grows unbounded because nothing else calls Cleanup.
+	c.writtenSinceCleanup += int64(len(entryData))
+	if c.writtenSinceCleanup > cleanupCheckBytes {
+		c.writtenSinceCleanup = 0
+		go c.cleanupIfSizeExceeded()
+	}
 	return nil
+}
+
+// cleanupIfSizeExceeded removes expired entries and evicts down to the size
+// limit, skipping the run if one is already in progress.
+func (c *Cache) cleanupIfSizeExceeded() {
+	if !c.cleanupPending.CompareAndSwap(false, true) {
+		return
+	}
+	defer c.cleanupPending.Store(false)
+
+	if err := c.Cleanup(); err != nil {
+		c.logger.Warn("Background cache cleanup failed: %v", err)
+	}
 }
 
 // Get retrieves data from the cache
@@ -174,6 +206,40 @@ func (c *Cache) getLocked(key string) ([]byte, bool, error) {
 }
 
 // Delete removes an entry from the cache
+// Keys returns all cache keys matching the given prefix (all keys when the
+// prefix is empty). It reads each entry file, so it is intended for
+// maintenance operations, not hot paths.
+func (c *Cache) Keys(prefix string) ([]string, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	var keys []string
+	err := filepath.Walk(c.directory, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return err
+		}
+
+		entryData, err := os.ReadFile(path)
+		if err != nil {
+			return nil // Skip unreadable files
+		}
+
+		var entry CacheEntry
+		if err := json.Unmarshal(entryData, &entry); err != nil {
+			return nil // Skip invalid entries
+		}
+
+		if prefix == "" || strings.HasPrefix(entry.Key, prefix) {
+			keys = append(keys, entry.Key)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list cache keys: %w", err)
+	}
+	return keys, nil
+}
+
 func (c *Cache) Delete(key string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()

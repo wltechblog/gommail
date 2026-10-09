@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -256,4 +257,63 @@ func TestCache_Size(t *testing.T) {
 	}
 
 	t.Logf("Cache size after adding data: %d bytes", size)
+}
+
+func TestKeysWithPrefix(t *testing.T) {
+	dir := t.TempDir()
+	c := New(dir, false, 100)
+
+	for _, k := range []string{"acct:messages:INBOX", "acct:messages:Sent", "acct:folders:list", "other:messages:INBOX"} {
+		if err := c.Set(k, []byte("data"), 0); err != nil {
+			t.Fatalf("Set(%s) failed: %v", k, err)
+		}
+	}
+
+	keys, err := c.Keys("acct:messages:")
+	if err != nil {
+		t.Fatalf("Keys failed: %v", err)
+	}
+	if len(keys) != 2 {
+		t.Fatalf("expected 2 keys with prefix, got %v", keys)
+	}
+
+	all, err := c.Keys("")
+	if err != nil {
+		t.Fatalf("Keys(\"\") failed: %v", err)
+	}
+	if len(all) != 4 {
+		t.Fatalf("expected 4 keys total, got %v", all)
+	}
+}
+
+func TestSetTriggersCleanupWhenOverLimit(t *testing.T) {
+	dir := t.TempDir()
+	c := New(dir, false, 1) // 1MB limit
+
+	big := make([]byte, 512*1024) // 512KB per entry
+	// Write 60MB total: this crosses cleanupCheckBytes (32MB) at least
+	// once, so a background cleanup must run and evict down to the limit.
+	for i := 0; i < 120; i++ {
+		if err := c.Set(fmt.Sprintf("k%d", i), big, 0); err != nil {
+			t.Fatalf("Set failed: %v", err)
+		}
+	}
+
+	// Cleanup runs asynchronously after the crossing; wait for eviction.
+	// The guarantee is bounded overshoot: at most cleanupCheckBytes (32MB)
+	// can be written between cleanups, so the final size stays well under
+	// the 60MB written.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		size, err := c.Size()
+		if err != nil {
+			t.Fatalf("Size failed: %v", err)
+		}
+		if size < 30*1024*1024 { // well below the 30MB worst-case overshoot bound
+			return // eviction happened
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	size, _ := c.Size()
+	t.Fatalf("cache size %d bytes shows no sign of eviction after exceeding the limit", size)
 }

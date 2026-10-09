@@ -1285,8 +1285,7 @@ func (mw *MainWindow) cleanup(fastShutdown bool) {
 		// Force stop and disconnect IMAP clients without server communication
 		if mw.imapClient != nil {
 			mw.logger.Debug("Force stopping and disconnecting main IMAP client")
-			mw.imapClient.Stop() // Stop the worker
-			mw.imapClient.ForceDisconnect()
+			mw.imapClient.Stop() // Stops the worker and closes all connections
 		}
 
 		// Force stop and disconnect all account clients

@@ -1,10 +1,12 @@
 package imap
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
 	"github.com/wltechblog/gommail/internal/email"
+	"github.com/wltechblog/gommail/pkg/cache"
 )
 
 // TestClientWrapperImplementsInterface verifies that ClientWrapper implements email.IMAPClient
@@ -272,5 +274,65 @@ func BenchmarkClientWrapperCreation(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		wrapper := NewClientWrapper(config)
 		wrapper.Stop() // Clean up
+	}
+}
+
+func TestCacheInvalidationDeletesWorkerKeys(t *testing.T) {
+	dir := t.TempDir()
+	c := cache.New(dir, false, 100)
+	wrapper := NewClientWrapperWithCache(email.ServerConfig{Host: "h", Port: 1}, c, "acct")
+
+	// Seed entries with the same keys the worker writes.
+	for _, tc := range []struct{ keyType, id string }{
+		{"messages", "INBOX"}, {"folders", "list"}, {"folders", "subscribed"},
+	} {
+		key := cache.GenerateAccountKey("acct", tc.keyType, tc.id)
+		if err := c.Set(key, []byte("data"), time.Hour); err != nil {
+			t.Fatalf("seed Set(%s) failed: %v", key, err)
+		}
+	}
+
+	wrapper.InvalidateMessageCache("INBOX")
+	wrapper.InvalidateFolderCache()
+	wrapper.InvalidateSubscribedFolderCache()
+
+	for _, tc := range []struct{ keyType, id string }{
+		{"messages", "INBOX"}, {"folders", "list"}, {"folders", "subscribed"},
+	} {
+		key := cache.GenerateAccountKey("acct", tc.keyType, tc.id)
+		if _, found, _ := c.Get(key); found {
+			t.Errorf("key %s still present after invalidation", key)
+		}
+	}
+}
+
+func TestCleanupUnsubscribedFolderCache(t *testing.T) {
+	dir := t.TempDir()
+	c := cache.New(dir, false, 100)
+	wrapper := NewClientWrapperWithCache(email.ServerConfig{Host: "h", Port: 1}, c, "acct")
+
+	subscribed := []email.Folder{{Name: "INBOX"}, {Name: "Sent"}}
+	data, _ := json.Marshal(subscribed)
+	if err := c.Set(cache.GenerateAccountKey("acct", "folders", "subscribed"), data, time.Hour); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+	for _, folder := range []string{"INBOX", "Sent", "OldFolder"} {
+		key := cache.GenerateAccountKey("acct", "messages", folder)
+		if err := c.Set(key, []byte("messages"), time.Hour); err != nil {
+			t.Fatalf("seed failed: %v", err)
+		}
+	}
+
+	if err := wrapper.CleanupUnsubscribedFolderCache(); err != nil {
+		t.Fatalf("CleanupUnsubscribedFolderCache failed: %v", err)
+	}
+
+	if _, found, _ := c.Get(cache.GenerateAccountKey("acct", "messages", "OldFolder")); found {
+		t.Error("unsubscribed folder cache should have been deleted")
+	}
+	for _, folder := range []string{"INBOX", "Sent"} {
+		if _, found, _ := c.Get(cache.GenerateAccountKey("acct", "messages", folder)); !found {
+			t.Errorf("subscribed folder %s cache should have been kept", folder)
+		}
 	}
 }

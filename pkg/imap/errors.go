@@ -25,4 +25,3 @@ func wrapResponseError(commandName string, response *IMAPResponse) error {
 	}
 	return nil
 }
-

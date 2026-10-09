@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -727,45 +728,82 @@ func (w *ClientWrapper) GetMonitoringMode() email.MonitorMode {
 	return email.MonitorModeIdle
 }
 
-// CleanupUnsubscribedFolderCache cleans up cache data for unsubscribed folders
-func (w *ClientWrapper) CleanupUnsubscribedFolderCache() error {
-	// Delegate to worker
-	cmd := NewCommand(CmdCleanupUnsubscribedFolderCache, nil)
-	response, err := w.sendCommandWithTimeout(cmd, w.defaultTimeout)
-	if err != nil {
-		return err
+// cacheKeyFor builds a cache key using the same scheme as the worker's
+// getCacheKey, so invalidation matches what the worker wrote.
+func (w *ClientWrapper) cacheKeyFor(keyType, identifier string) string {
+	if w.accountKey == "" {
+		return cache.GenerateKey(keyType, identifier)
 	}
-	return response.Error
+	return cache.GenerateAccountKey(w.accountKey, keyType, identifier)
+}
+
+// CleanupUnsubscribedFolderCache deletes cached message lists for folders
+// that are no longer subscribed. The subscribed set is read from the cached
+// subscribed-folder list; if it is unavailable nothing is deleted, so a
+// missing cache never wipes every folder's cache.
+func (w *ClientWrapper) CleanupUnsubscribedFolderCache() error {
+	if w.cache == nil {
+		return nil
+	}
+
+	subscribed := make(map[string]bool)
+	if data, found, err := w.cache.Get(w.cacheKeyFor("folders", "subscribed")); err != nil {
+		return fmt.Errorf("failed to read cached subscribed folders: %w", err)
+	} else if found {
+		var folders []email.Folder
+		if err := json.Unmarshal(data, &folders); err != nil {
+			return fmt.Errorf("failed to decode cached subscribed folders: %w", err)
+		}
+		for _, f := range folders {
+			subscribed[f.Name] = true
+		}
+	}
+	if len(subscribed) == 0 {
+		return nil
+	}
+
+	prefix := w.cacheKeyFor("messages", "")
+	keys, err := w.cache.Keys(prefix)
+	if err != nil {
+		return fmt.Errorf("failed to list cached message folders: %w", err)
+	}
+	for _, key := range keys {
+		folder := strings.TrimPrefix(key, prefix)
+		if !subscribed[folder] {
+			w.logger.Debug("Deleting cache for unsubscribed folder: %s", folder)
+			if err := w.cache.Delete(key); err != nil {
+				w.logger.Warn("Failed to delete cache for unsubscribed folder %s: %v", folder, err)
+			}
+		}
+	}
+	return nil
 }
 
 // InvalidateFolderCache invalidates the folder cache
 func (w *ClientWrapper) InvalidateFolderCache() {
-	// Send command to worker to invalidate folder cache
-	cmd := NewCommand(CmdInvalidateFolderCache, nil)
-	w.sendCommandWithTimeout(cmd, w.defaultTimeout) // Fire and forget
+	w.deleteCacheKey("folders", "list", "folder cache")
 }
 
 // InvalidateSubscribedFolderCache invalidates the subscribed folder cache
 func (w *ClientWrapper) InvalidateSubscribedFolderCache() {
-	// Send command to worker to invalidate subscribed folder cache
-	cmd := NewCommand(CmdInvalidateSubscribedFolderCache, nil)
-	w.sendCommandWithTimeout(cmd, w.defaultTimeout) // Fire and forget
+	w.deleteCacheKey("folders", "subscribed", "subscribed folder cache")
 }
 
 // InvalidateMessageCache invalidates the message cache for a specific folder
 func (w *ClientWrapper) InvalidateMessageCache(folder string) {
-	// Send command to worker to invalidate message cache
-	cmd := NewCommand(CmdInvalidateMessageCache, map[string]interface{}{
-		ParamFolderName: folder,
-	})
-	w.sendCommandWithTimeout(cmd, w.defaultTimeout) // Fire and forget
+	w.deleteCacheKey("messages", folder, fmt.Sprintf("message cache for %s", folder))
 }
 
-// ForceDisconnect forces disconnection without graceful cleanup
-func (w *ClientWrapper) ForceDisconnect() {
-	// Send command to worker to force disconnect
-	cmd := NewCommand(CmdForceDisconnect, nil)
-	w.sendCommandWithTimeout(cmd, w.defaultTimeout) // Fire and forget
+// deleteCacheKey removes a single cache entry, logging failures. These
+// methods previously sent worker commands that had no handler, so cache
+// entries stayed stale until their TTL expired.
+func (w *ClientWrapper) deleteCacheKey(keyType, identifier, description string) {
+	if w.cache == nil {
+		return
+	}
+	if err := w.cache.Delete(w.cacheKeyFor(keyType, identifier)); err != nil {
+		w.logger.Warn("Failed to invalidate %s: %v", description, err)
+	}
 }
 
 // RefreshFoldersInBackground starts background folder refresh
