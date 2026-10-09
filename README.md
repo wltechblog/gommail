@@ -2,6 +2,8 @@
 
 Cross-platform IMAP/SMTP desktop email client for people who want a native Go + Fyne experience with modern conveniences such as a unified inbox, background sync, and safe HTML rendering.
 
+![gommail main window](screenshot-mainwindow.png)
+
 ## Project Status
 - Daily-driver ready with multi-account support, idle monitoring, and resilient reconnection logic
 - First public release: expect ongoing polishing, but the app is fully functional for common workflows
