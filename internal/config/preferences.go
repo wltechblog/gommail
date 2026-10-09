@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -19,8 +20,12 @@ type PreferencesConfig struct {
 	logger  *logging.Logger
 	profile string
 
-	// Cached data to avoid repeated JSON deserialization
-	accounts       []Account
+	// accountsMu guards the cached account list: Get/Set/Save can be called
+	// from settings, wizards and background workers concurrently.
+	accountsMu sync.RWMutex
+	accounts   []Account
+	// accountsCached is written under accountsMu only (loadAccounts callers
+	// hold the lock; reads of the flag alone tolerate staleness).
 	accountsCached bool
 }
 
@@ -91,17 +96,24 @@ func (pc *PreferencesConfig) Save() error {
 
 // GetAccounts returns the accounts from cache or loads them from preferences
 func (pc *PreferencesConfig) GetAccounts() []Account {
-	if !pc.accountsCached {
+	pc.accountsMu.RLock()
+	cached := pc.accountsCached
+	pc.accountsMu.RUnlock()
+	if !cached {
 		if err := pc.loadAccounts(); err != nil {
 			pc.logger.Error("Failed to load accounts: %v", err)
 			return []Account{}
 		}
 	}
+	pc.accountsMu.RLock()
+	defer pc.accountsMu.RUnlock()
 	return pc.accounts
 }
 
-// SetAccounts updates the accounts and marks cache as dirty
+// SetAccounts updates the accounts and marks cache as loaded
 func (pc *PreferencesConfig) SetAccounts(accounts []Account) {
+	pc.accountsMu.Lock()
+	defer pc.accountsMu.Unlock()
 	pc.accounts = accounts
 	pc.accountsCached = true
 }
@@ -217,8 +229,10 @@ func (pc *PreferencesConfig) loadAccounts() error {
 	accountsJSON := pc.prefs.StringWithFallback("accounts.data", "[]")
 
 	if accountsJSON == "[]" {
+		pc.accountsMu.Lock()
 		pc.accounts = []Account{}
 		pc.accountsCached = true
+		pc.accountsMu.Unlock()
 		return nil
 	}
 
@@ -227,20 +241,25 @@ func (pc *PreferencesConfig) loadAccounts() error {
 		return fmt.Errorf("failed to unmarshal accounts JSON: %w", err)
 	}
 
+	pc.accountsMu.Lock()
 	pc.accounts = accounts
 	pc.accountsCached = true
+	pc.accountsMu.Unlock()
 	return nil
 }
 
 // saveAccounts saves accounts as JSON to preferences
 func (pc *PreferencesConfig) saveAccounts() error {
+	pc.accountsMu.RLock()
 	accountsJSON, err := json.Marshal(pc.accounts)
+	count := len(pc.accounts)
+	pc.accountsMu.RUnlock()
 	if err != nil {
 		return fmt.Errorf("failed to marshal accounts to JSON: %w", err)
 	}
 
 	pc.prefs.SetString("accounts.data", string(accountsJSON))
-	pc.prefs.SetInt("accounts.count", len(pc.accounts))
+	pc.prefs.SetInt("accounts.count", count)
 	return nil
 }
 

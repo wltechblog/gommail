@@ -2,6 +2,7 @@
 package notification
 
 import (
+	"sync"
 	"fmt"
 	"runtime"
 	"time"
@@ -39,6 +40,9 @@ type Config struct {
 
 // Manager manages the notification system
 type Manager struct {
+	// mu guards config.Enabled, which worker callback goroutines read via
+	// Show while SetEnabled can be called from the settings UI.
+	mu       sync.RWMutex
 	config   Config
 	notifier Notifier
 	logger   *logging.Logger
@@ -66,7 +70,10 @@ func NewManager(config Config) (*Manager, error) {
 
 // Show displays a notification if enabled
 func (m *Manager) Show(notification Notification) error {
-	if !m.config.Enabled {
+	m.mu.RLock()
+	enabled := m.config.Enabled
+	m.mu.RUnlock()
+	if !enabled {
 		m.logger.Debug("Notifications disabled, skipping: %s", notification.Title)
 		return nil
 	}
@@ -199,6 +206,8 @@ type MessageInfo struct {
 
 // IsEnabled returns true if notifications are enabled
 func (m *Manager) IsEnabled() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.config.Enabled
 }
 
@@ -209,7 +218,9 @@ func (m *Manager) IsSupported() bool {
 
 // SetEnabled enables or disables notifications
 func (m *Manager) SetEnabled(enabled bool) {
+	m.mu.Lock()
 	m.config.Enabled = enabled
+	m.mu.Unlock()
 	m.logger.Info("Notifications %s", map[bool]string{true: "enabled", false: "disabled"}[enabled])
 }
 

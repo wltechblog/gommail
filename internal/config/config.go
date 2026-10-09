@@ -195,9 +195,16 @@ func (c *Config) Save() error {
 
 	logger.Debug("Configuration marshaled successfully (%d bytes)", len(data))
 
-	err = os.WriteFile(configPath, data, 0600)
-	if err != nil {
-		logger.Error("Failed to write configuration file %s: %v", configPath, err)
+	// Write via temp file + rename so a crash or concurrent save can never
+	// leave a truncated config behind.
+	tmpPath := configPath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
+		logger.Error("Failed to write configuration file %s: %v", tmpPath, err)
+		return err
+	}
+	if err := os.Rename(tmpPath, configPath); err != nil {
+		logger.Error("Failed to replace configuration file %s: %v", configPath, err)
+		os.Remove(tmpPath)
 		return err
 	}
 
